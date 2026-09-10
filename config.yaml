@@ -1,0 +1,55 @@
+# Caps and safety rails. The executor reads these before every action.
+
+limits:
+  emails_per_day: 20          # hard cap. gmail allows 500. do not raise this.
+  min_gap_seconds: 90         # randomized 1x to 3x this between sends
+  max_forms_per_run: 10
+  company_cooldown_days: 45   # never contact the same company twice inside this
+  followup_after_days: 7
+  followups_max: 1
+
+safety:
+  dry_run: true               # flip to false only when you have read 10 drafts
+  require_verified_contact: true   # never email a guessed address
+  never_auto_submit: true     # the filler fills, you press submit. keep true.
+
+scoring:
+  min_fit_to_draft: 0.55
+  role_families: [sde, ml, data, product]
+  preferred_locations: [Bangalore, Hyderabad, Pune, Chennai, Remote]
+  hard_excludes:              # drop the posting outright if title matches
+    - "senior"
+    - "staff"
+    - "principal"
+    - "manager"
+    - "5+ years"
+    - "unpaid"
+
+sources:
+  gmail:
+    enabled: true
+    label: job-alerts         # collector reads this label, never your inbox
+    lookback_days: 30
+  whatsapp:
+    enabled: false            # turn on at step 06
+    waha_url: http://localhost:3000
+    channel_id: ""
+  rss:
+    enabled: false
+    feeds: []
+
+resume:
+  mode: variant               # variant | fixed | tailored
+  #  variant  : assets/resume_<role_family>.pdf, falls back to default. simple, use this.
+  #  fixed    : always assets/resume_default.pdf
+  #  tailored : build from resume.yaml per job. only if you filled the bank.
+  # assets/custom/<job_id>.pdf beats all three, always.
+  max_pages: 1
+  output_dir: data/resumes
+  # the selector may reorder and drop bullets. it may never write new ones.
+  allow_generated_bullets: false
+  min_keyword_coverage: 0.4   # warn below this
+
+llm:
+  batch_size: 15              # raw items per extract call
+  timeout_seconds: 180

@@ -1,0 +1,89 @@
+# Copy this to profile.yaml and fill it in. profile.yaml is gitignored, so your
+# details never leave your machine.
+#
+#     cp profile.example.yaml profile.yaml
+#
+# Or just run `python run.py init`, which copies it for you, then edit it from
+# the dashboard at /profile.
+
+identity:
+  full_name: ""
+  first_name: ""
+  last_name: ""
+  email: ""
+  phone: ""                       # with country code, eg +919876543210
+  city: ""
+  state: ""
+  country: India
+  github: ""                      # https://github.com/you
+  linkedin: ""                    # https://linkedin.com/in/you
+  portfolio: ""                   # optional, blank is fine
+
+education:
+  college: ""
+  degree: ""                      # eg B.Tech
+  branch: ""                      # eg Computer Science and Engineering
+  cgpa: ""
+  grad_year: ""                   # eg 2027
+  grad_month: ""                  # eg July
+  reg_no: ""
+  tenth_percentage: ""            # Indian portals ask for this constantly
+  twelfth_percentage: ""
+
+logistics:
+  notice_period: ""               # eg "Available from July 2027"
+  willing_to_relocate: "Yes"
+  work_authorization: ""          # eg "Indian citizen, no sponsorship required"
+  current_ctc: "NA - student"
+  expected_ctc: "As per company standards"
+  gender: ""                      # leave blank unless a form demands it
+
+# Free text the form filler reuses verbatim for the questions every portal asks.
+# Anything left null gets generated per company instead.
+answer_bank:
+  why_this_company: null
+  why_this_role: null
+  strengths: >
+    Two or three sentences you would actually say out loud.
+  weakness: >
+    Something real, plus what you changed about how you work.
+  leadership: >
+    A team you ran or a thing you organised.
+  relocate: "Yes, anywhere in India."
+  availability: ""
+
+# The ONLY claims the drafter is allowed to make about you. It picks the two
+# whose tags best match a posting and builds the mail around them.
+#
+# Keep every line to something you can walk through in an interview. Lines
+# still containing the word FILL are skipped rather than sent, so an unfinished
+# entry costs you a weaker mail, never a false one.
+#
+# Useful tags: python java cpp typescript sql ml data ai backend api web
+# fullstack mobile security network crypto algorithms cp compilers devops
+# infra product leadership
+evidence:
+  - id: project_one
+    tags: [ml, data, python]
+    line: >
+      FILL: one sentence on your strongest project. What it does, and the one
+      technical decision worth asking you about.
+  - id: project_two
+    tags: [backend, api, fullstack]
+    line: >
+      FILL: one sentence on a second project, ideally in a different area so
+      the matcher has something to choose between.
+  - id: internship
+    tags: [sde, backend]
+    line: >
+      FILL: one sentence on an internship or paid work. What you built and what
+      it replaced.
+  - id: leadership
+    tags: [leadership, product]
+    line: >
+      FILL: one sentence on a team or society role, if you have one.
+  - id: algorithms
+    tags: [algorithms, cp]
+    line: >
+      FILL: one sentence on competitive programming or an algorithms-heavy
+      project, if that is a strength.

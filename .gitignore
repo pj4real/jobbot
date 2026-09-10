@@ -1,0 +1,27 @@
+# ---- your details. never commit these. ----
+profile.yaml
+resume.yaml
+secrets/
+assets/*.pdf
+assets/custom/*.pdf
+
+# ---- runtime state ----
+data/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# ---- python ----
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# ---- os and editors ----
+.DS_Store
+.idea/
+.vscode/
+*.swp

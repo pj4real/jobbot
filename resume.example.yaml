@@ -1,0 +1,87 @@
+# Copy to resume.yaml. Only used when config.yaml has resume.mode: tailored.
+# For the default variant mode you just drop PDFs in assets/ instead.
+#
+# This is a bank of every bullet you would ever put on a resume. The engine
+# SELECTS and ORDERS from it per application. It never writes new bullets,
+# which is the point: a resume assembled from a fixed bank cannot claim
+# something you did not do.
+#
+# weight is your own prior, 1 to 5, for how much you want a line seen.
+# lines is roughly how many rendered lines it takes, for the one page budget.
+# tags drive matching against the job description.
+
+header:
+  name: ""
+  tagline_pool:                   # the selector picks one, it never invents one
+    - id: tl_swe
+      tags: [sde, backend, fullstack]
+      text: "One line, backend flavoured."
+    - id: tl_ml
+      tags: [ml, data, ai]
+      text: "One line, ML flavoured."
+    - id: tl_product
+      tags: [product, leadership]
+      text: "One line, product flavoured."
+
+education:
+  - institution: ""
+    degree: ""
+    dates: ""                     # eg "2023 - 2027"
+    detail: ""                    # eg "CGPA 9.0 / 10"
+    coursework:
+      - id: cw_core
+        tags: [sde, backend]
+        text: "Data Structures, Algorithms, Operating Systems, DBMS, Networks"
+      - id: cw_ml
+        tags: [ml, data]
+        text: "Machine Learning, Linear Algebra, Probability"
+
+experience:
+  - org: ""
+    role: ""
+    dates: ""
+    location: ""
+    bullets:
+      - id: exp_1
+        tags: [sde, backend]
+        weight: 4
+        lines: 2
+        text: "FILL: what you did and what came of it."
+
+projects:
+  - id: p_one
+    name: ""
+    subtitle: ""
+    stack: []
+    link: ""
+    tags: [ml, python]
+    weight: 5
+    bullets:
+      - id: p1_a
+        tags: [ml, python]
+        weight: 5
+        lines: 2
+        text: "FILL: what it does and how."
+      - id: p1_b
+        tags: [data]
+        weight: 3
+        lines: 1
+        text: "FILL: the result, with a real number if you have one."
+
+skills:
+  - group: Languages
+    items:
+      - {id: sk_py,  text: Python,     tags: [python, ml, data]}
+      - {id: sk_cpp, text: C++,        tags: [cpp, algorithms]}
+      - {id: sk_sql, text: SQL,        tags: [sql, data, backend]}
+  - group: Tools
+    items:
+      - {id: sk_git,  text: Git,    tags: [sde, tools]}
+      - {id: sk_dock, text: Docker, tags: [devops, backend]}
+
+achievements:
+  - id: ach_1
+    tags: [algorithms, cp]
+    weight: 4
+    lines: 1
+    text: "FILL: ratings, ranks, or anything with a number attached."

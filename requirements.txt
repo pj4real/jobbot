@@ -1,0 +1,14 @@
+# core
+pyyaml>=6.0
+
+# gmail
+google-api-python-client>=2.100
+google-auth-oauthlib>=1.1
+google-auth-httplib2>=0.1.1
+
+# added in later stages, safe to install now
+playwright>=1.44
+fastapi>=0.110
+uvicorn>=0.29
+jinja2>=3.1
+python-multipart>=0.0.9
