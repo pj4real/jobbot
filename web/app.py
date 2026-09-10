@@ -1,13 +1,15 @@
-"""The control panel. Everything the CLI does, from one page on localhost.
+"""The dashboard.
 
-    python run.py web     ->  http://127.0.0.1:8000
+Organised around what you think about, not what the database stores: what did
+it find, what am I applying to, who owes me a reply, what is dead. Three tabs,
+not ten.
 
-Design rule that keeps this honest: the dashboard never reimplements an action.
-Every button shells out to the same find.py, mail.py or fill.py you would type,
-so the guards in core/send.py and fill/filler.py are the only guards that exist
-and there is no second path to anything dangerous.
+It never reimplements an action. Every button shells out to the same find.py,
+mail.py or fill.py you would type by hand, so the guards in core/send.py and
+fill/filler.py are the only guards that exist.
 """
 from __future__ import annotations
+import html
 import json
 import sys
 import time
@@ -19,16 +21,17 @@ from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from core import db                                    # noqa: E402
-from core.config import config                         # noqa: E402
-from core import send as sender                        # noqa: E402
-from web import runner, editor, files, gmail_oauth, profileform  # noqa: E402
+from core import db, board, triage                      # noqa: E402
+from core.config import config                          # noqa: E402
+from core import send as sender                         # noqa: E402
+from web import runner, editor, files, gmail_oauth, profileform, ui   # noqa: E402
 
 app = FastAPI(title="jobbot")
+E = html.escape
 
 
 class NotReady(Exception):
-    """The database is not usable yet. Recoverable, so say so plainly."""
+    """The database has no schema yet. Recoverable, so say so plainly."""
 
 
 def rows(sql, args=()):
@@ -42,393 +45,785 @@ def rows(sql, args=()):
         raise
 
 
+def page(body: str, tab: str = "", scripts: str = "") -> HTMLResponse:
+    return HTMLResponse(ui.shell(body, tab, scripts))
+
+
 @app.exception_handler(NotReady)
 def not_ready(request, exc):
+    return page(ui.note(
+        "<b>The database is not set up yet.</b><br>"
+        "Run <span class='mono'>python run.py init</span> in the project folder. "
+        "It is safe to rerun and only fills in what is missing.", "bad"))
+
+
+def flash(saved: str = "", error: str = "") -> str:
+    if error:
+        return ui.note(E(error), "bad")
+    if saved:
+        return ui.note(E(saved), "good")
+    return ""
+
+
+# ================================================================== board
+
+ACTION_CHIP = {"triage": "act", "review": "act", "followup": "act",
+               "reply": "good", "send": "go", "fill": "go", "draft": "go"}
+
+
+def job_row(r: dict) -> str:
+    a = r["action"]
+    fit = r.get("fit_score") or 0
+    co = E(r.get("company") or "Unknown company")
+    title = E(r.get("title") or "")
+    meta = []
+    if r.get("location"):
+        meta.append(E(r["location"]))
+    if r.get("apply_kind") and r["apply_kind"] != "unknown":
+        meta.append(E(r["apply_kind"]))
+    if r.get("deadline"):
+        meta.append("closes " + E(r["deadline"]))
+    if r.get("to_email"):
+        meta.append(E(r["to_email"]))
+    if r.get("waiting_days") is not None and r["stage"] in ("applied", "waiting"):
+        d = r["waiting_days"]
+        meta.append(f"sent {'today' if d == 0 else str(d) + 'd ago'}")
+    for s in (r.get("skills") or [])[:4]:
+        meta.append(E(s))
+
+    buttons = []
+    jid = r["id"]
+    if a["kind"] == "triage":
+        buttons.append(
+            f'<form method="post" action="/job/{jid}/keep" style="display:inline">'
+            f'<button class="go sm">Keep</button></form>')
+        buttons.append(
+            f'<form method="post" action="/job/{jid}/skip" style="display:inline">'
+            f'<button class="btn-quiet sm">Skip</button></form>')
+    elif a["kind"] == "fill":
+        buttons.append(f'<button class="go sm" data-fill="{jid}">Fill form</button>')
+    elif a["kind"] == "review":
+        buttons.append(f'<a class="btn btn-go sm" href="/draft/{r["app_id"]}">Read draft</a>')
+    elif a["kind"] == "draft":
+        buttons.append(f'<button class="go sm" data-job="draft">Write mail</button>')
+    elif a["kind"] == "followup":
+        buttons.append(f'<button class="btn-warn sm" data-job="followup">Follow up</button>')
+    elif a["kind"] == "reply":
+        buttons.append(f'<a class="btn sm" href="/job/{jid}">Open</a>')
+    if r.get("apply_url") and a["kind"] not in ("triage",):
+        buttons.append(f'<a class="btn sm" href="{E(r["apply_url"])}" target="_blank" '
+                       f'rel="noopener">Site</a>')
+
+    chip = ACTION_CHIP.get(a["kind"], "")
+    hint = ""
+    if a["kind"] == "triage":
+        # the scorer's reasoning belongs in the meta line, not shouted in a chip
+        why = (r.get("fit_reason") or "").split(";")[0].strip()
+        hint = f'<span class="chip">{E(why)[:26]}</span>' if why else ""
+    elif a.get("hint"):
+        hint = f'<span class="chip {chip}">{E(a["hint"])[:32]}</span>' 
+
+    return f"""<div class="row" data-job="{jid}">
+  <div class="fit"><div class="meter"><i style="width:{int(fit*100)}%"></i></div>
+    <b>{fit:.2f}</b></div>
+  <div class="who">
+    <div class="co"><a href="/job/{jid}">{co}</a></div>
+    <div class="role">{title}</div>
+    <div class="meta">{"".join(f"<span>{m}</span>" for m in meta[:6])}</div>
+  </div>
+  <div class="act">{hint}{"".join(buttons)}</div>
+</div>"""
+
+
+BOARD_JS = """
+<script>
+document.addEventListener('click', e => {
+  const b = e.target.closest('[data-fill]');
+  if (!b) return;
+  b.disabled = true; b.textContent = 'opening...';
+  fetch('/api/fill_job/' + b.dataset.fill, {method:'POST'})
+    .then(r => r.json())
+    .then(d => { location.href = '/setup?run=' + d.run_id + '#run'; });
+});
+let sel = -1;
+const rowsOf = () => [...document.querySelectorAll('.row[data-job]')];
+function focusRow(i){
+  const rs = rowsOf(); if(!rs.length) return;
+  sel = Math.max(0, Math.min(rs.length-1, i));
+  rs.forEach(r => r.style.outline='');
+  const r = rs[sel];
+  r.style.outline = '2px solid var(--accent)';
+  r.scrollIntoView({block:'nearest'});
+}
+document.addEventListener('keydown', e => {
+  if (/input|textarea|select/i.test(document.activeElement.tagName)) return;
+  if (e.key === 'j') { focusRow(sel+1); e.preventDefault(); }
+  if (e.key === 'k') { focusRow(sel-1); e.preventDefault(); }
+  const rs = rowsOf();
+  if (sel < 0 || !rs[sel]) return;
+  const id = rs[sel].dataset.job;
+  if (e.key === 'y') { post('/job/'+id+'/keep'); }
+  if (e.key === 'n') { post('/job/'+id+'/skip'); }
+  if (e.key === 'Enter') { location.href = '/job/'+id; }
+});
+function post(url){
+  const f = document.createElement('form');
+  f.method='post'; f.action=url; document.body.appendChild(f); f.submit();
+}
+</script>"""
+
+
+@app.get("/", response_class=HTMLResponse)
+def home(stage: str = "", saved: str = "", error: str = ""):
+    b = board.board()
+    counts = {s: len(b[s]) for s in board.STAGES}
+    head = board.headline()
+    stage = stage or head["where"]
+    if stage not in board.STAGES:
+        stage = "found"
+
+    rail = "".join(
+        f'<a href="/?stage={s}" class="{"on" if s == stage else ""}'
+        f'{" hot" if s in ("found", "replied", "waiting") and counts[s] and s != stage else ""}">'
+        f'{board.STAGE_LABEL[s]} <b>{counts[s]}</b></a>'
+        for s in board.STAGES)
+
+    items = b[stage]
+    if items:
+        listing = '<div class="rows">' + "".join(job_row(r) for r in items) + '</div>'
+    else:
+        listing = EMPTY_FOR.get(stage, ui.empty("Nothing here", ""))
+
+    sub = ""
+    if head["tone"] != "idle":
+        sub = '<span class="sub">press <kbd>j</kbd> <kbd>k</kbd> to move, ' \
+              '<kbd>y</kbd> keep, <kbd>n</kbd> skip</span>'
+
     return page(f"""
-<div class="note bad">
-  <b>The database is not set up yet.</b><br>
-  <span class="mono small">{exc}</span>
+{flash(saved, error)}
+<div class="headline tone-{head['tone']}">
+  <h1>{E(head['text'])}</h1>{sub}
+  <div class="grow"></div>
+  <button class="go" data-job="find" onclick="location.href='/setup?start=find#run'">
+    Scan my mail</button>
 </div>
-<p>Run this once, in the project folder:</p>
-<pre>python run.py init</pre>
-<p class="small dim">This happens when a first init was interrupted: the file
-gets created but the tables never land in it. Init is safe to rerun as often
-as you like, it only fills in what is missing.</p>
-<div class="row"><a class="btn primary" href="/">try again</a></div>
-""", "")
+<div class="rail">{rail}</div>
+<p class="rail-note">{E(board.STAGE_BLURB[stage])}</p>
+{listing}
+""", "Board", BOARD_JS)
 
 
-# ------------------------------------------------------------------ chrome
+EMPTY_FOR = {
+    "found": ui.empty("No new openings", "Scan your mail and anything that looks "
+                      "like a posting lands here.",
+                      '<a class="btn btn-go" href="/setup?start=find#run">Scan my mail</a>'),
+    "shortlisted": ui.empty("Nothing to apply to yet",
+                            "Keep something from Found and it moves here."),
+    "applied": ui.empty("No applications yet",
+                        "Fill a form or send a mail and it shows up here."),
+    "waiting": ui.empty("Nobody is overdue",
+                        "Applications appear here once they have been silent for a week."),
+    "replied": ui.empty("No replies yet",
+                        "Run Check replies after you have sent a few."),
+    "closed": ui.empty("Nothing closed", "Skipped and rejected jobs collect here."),
+}
 
-CSS = """
-:root{--bg:#f6f7f8;--card:#fff;--ink:#14191c;--dim:#5a666d;--line:#e2e6e9;
---acc:#10566b;--accbg:#ddebf0;--warn:#a25708;--warnbg:#f7e9d6;--bad:#93321f;
---badbg:#f6e2dd;--ok:#1c6b4a;--okbg:#dff0e7;--term:#0e1416;--termink:#c8d6da}
-@media(prefers-color-scheme:dark){:root{--bg:#0f1417;--card:#171d21;--ink:#e2e8eb;
---dim:#a0adb4;--line:#2a343a;--acc:#5fb4ce;--accbg:#12303b;--warn:#e0a55c;
---warnbg:#33240f;--bad:#e08573;--badbg:#351b15;--ok:#5cc79b;--okbg:#11321f;
---term:#0a0f11;--termink:#b8c8cd}}
-*{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.55 -apple-system,
-BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;padding:0 20px 90px}
-.wrap{max-width:1200px;margin:0 auto}
-header{display:flex;align-items:center;gap:20px;flex-wrap:wrap;
-padding:22px 0 14px;border-bottom:2px solid var(--ink)}
-h1{margin:0;font-size:19px;letter-spacing:-.02em}
-h2{font-size:15px;margin:30px 0 10px;letter-spacing:-.01em}
-h3{font-size:13px;margin:22px 0 6px;color:var(--dim);text-transform:uppercase;
-letter-spacing:.07em}
-nav{display:flex;gap:2px;flex-wrap:wrap}
-nav a{color:var(--dim);text-decoration:none;font-size:13px;padding:5px 10px;
-border-radius:5px}
-nav a:hover{background:var(--card)}
-nav a.on{color:var(--acc);background:var(--accbg);font-weight:600}
-.spacer{flex:1}
-.stats{display:flex;gap:8px;flex-wrap:wrap;margin:16px 0 4px}
-.stat{background:var(--card);border:1px solid var(--line);border-radius:6px;
-padding:9px 13px;min-width:86px}
-.stat b{display:block;font-size:19px;font-variant-numeric:tabular-nums}
-.stat span{font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.07em}
-.stat.hot b{color:var(--warn)}
-table{width:100%;border-collapse:collapse;margin:8px 0 0;font-size:13px}
-th{text-align:left;font-size:10.5px;text-transform:uppercase;letter-spacing:.07em;
-color:var(--dim);padding:0 10px 7px 0;border-bottom:1.5px solid var(--line)}
-td{padding:9px 10px 9px 0;border-bottom:1px solid var(--line);vertical-align:top}
-td.n{font-variant-numeric:tabular-nums;white-space:nowrap}
-a{color:var(--acc)}
-.pill{display:inline-block;font-size:10px;text-transform:uppercase;letter-spacing:.05em;
-padding:2px 6px;border-radius:3px;border:1px solid currentColor;white-space:nowrap}
-.p-needs_review{color:var(--warn)}.p-approved{color:var(--ok)}
-.p-submitted{color:var(--acc)}.p-rejected,.p-blocked{color:var(--bad)}
-.p-replied{color:var(--ok)}
-button,.btn{font:inherit;font-size:12.5px;padding:6px 12px;border-radius:6px;
-border:1px solid var(--line);background:var(--card);color:var(--ink);cursor:pointer;
-text-decoration:none;display:inline-block;line-height:1.3}
-button:hover,.btn:hover{border-color:var(--acc);color:var(--acc)}
-button:disabled{opacity:.45;cursor:not-allowed}
-button.go{border-color:var(--ok);color:var(--ok)}
-button.no,.btn.no{border-color:var(--bad);color:var(--bad)}
-button.danger{border-color:var(--bad);color:#fff;background:var(--bad)}
-button.danger:hover{opacity:.9;color:#fff}
-button.primary{border-color:var(--acc);background:var(--accbg);color:var(--acc);font-weight:600}
-.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:10px 0}
-.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:10px}
-.card{background:var(--card);border:1px solid var(--line);border-radius:7px;padding:14px}
-.card h4{margin:0 0 4px;font-size:13.5px}
-.card p{margin:0 0 10px;font-size:12px;color:var(--dim);line-height:1.45}
-pre{background:var(--card);border:1px solid var(--line);border-left:3px solid var(--acc);
-border-radius:5px;padding:14px 16px;white-space:pre-wrap;font-size:12.5px;
-font-family:ui-monospace,Menlo,monospace;overflow-x:auto;margin:8px 0}
-#log{background:var(--term);color:var(--termink);border:1px solid var(--line);
-border-radius:7px;padding:14px 16px;font:12px/1.6 ui-monospace,Menlo,monospace;
-white-space:pre-wrap;min-height:220px;max-height:62vh;overflow-y:auto;margin:10px 0}
-#log .err{color:#e08573}#log .ok{color:#5cc79b}#log .warn{color:#e0a55c}
-textarea{width:100%;min-height:60vh;font:12.5px/1.6 ui-monospace,Menlo,monospace;
-padding:14px;border:1px solid var(--line);border-radius:7px;background:var(--card);
-color:var(--ink);tab-size:2}
-textarea.short{min-height:300px}
-input[type=text],input[type=url]{width:100%;padding:9px 11px;border:1px solid var(--line);
-border-radius:6px;background:var(--card);color:var(--ink);font:inherit}
-.dim{color:var(--dim)}.small{font-size:12px}.mono{font-family:ui-monospace,Menlo,monospace}
-.bar{height:5px;background:var(--line);border-radius:3px;overflow:hidden;width:52px}
-.bar i{display:block;height:100%;background:var(--acc)}
-.note{background:var(--card);border:1px solid var(--line);border-left:3px solid var(--warn);
-border-radius:6px;padding:12px 14px;margin:12px 0;font-size:13px}
-.note.bad{border-left-color:var(--bad)}
-.note.ok{border-left-color:var(--ok)}
-.note.info{border-left-color:var(--acc)}
-.dot{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:6px}
-.dot.run{background:var(--warn);animation:pulse 1s infinite}
-.dot.ok{background:var(--ok)}.dot.err{background:var(--bad)}
-@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
-@media(prefers-reduced-motion:reduce){.dot.run{animation:none}}
-form.inline{display:inline}
-label.f{display:block;font-size:12px;color:var(--dim);margin:12px 0 4px}
+
+# ================================================================== one job
+
+@app.get("/job/{job_id}", response_class=HTMLResponse)
+def job_page(job_id: int):
+    r = rows(board.BOARD_SQL + " WHERE j.id = ?", (job_id,))
+    if not r:
+        return page(ui.note("No such job.", "bad"), "Board")
+    j = r[0]
+    j["stage"] = board.stage_of(j)
+    j["action"] = board.next_action(j, j["stage"])
+    j["skills"] = json.loads(j.get("skills_json") or "[]")
+
+    tl = "".join(
+        f'<li class="{"now" if i == 0 else ""}"><b>{E(t["kind"].replace("_", " ").title())}</b> '
+        f'<span class="dim">{E(t.get("detail") or "")}</span><br>'
+        f'<span class="when">{E((t.get("at") or "")[:16])}</span></li>'
+        for i, t in enumerate(reversed(board.timeline(job_id))))
+
+    raw = rows("SELECT ri.subject, ri.sender, ri.url, ri.received_at"
+               "  FROM jobs j JOIN raw_items ri ON ri.id = j.raw_item_id"
+               " WHERE j.id = ?", (job_id,))
+    src = ""
+    if raw:
+        s = raw[0]
+        addr = triage.address_of(s.get("sender") or "")
+        src = f"""<h3>Where it came from</h3>
+<div class="card">
+  <div class="sm"><b>{E(s.get('subject') or '')}</b></div>
+  <div class="sm dim mono">{E(s.get('sender') or '')}</div>
+  <div class="row-f">
+    <a class="btn sm" href="{E(s.get('url') or '#')}" target="_blank" rel="noopener">
+      Open in Gmail</a>
+    <form method="post" action="/sender/mute" style="display:inline">
+      <input type="hidden" name="addr" value="{E(addr)}">
+      <input type="hidden" name="back" value="/job/{job_id}">
+      <button class="btn-quiet sm">Never show this sender again</button>
+    </form>
+  </div>
+</div>"""
+
+    acts = []
+    if j.get("apply_url"):
+        acts.append(f'<button class="go" data-fill="{job_id}">Fill the form</button>')
+        acts.append(f'<a class="btn" href="{E(j["apply_url"])}" target="_blank" '
+                    f'rel="noopener">Open the posting</a>')
+    if j.get("app_id"):
+        acts.append(f'<a class="btn" href="/draft/{j["app_id"]}">Open the draft</a>')
+    if j["stage"] == "found":
+        acts.insert(0, f'<form method="post" action="/job/{job_id}/keep" '
+                       f'style="display:inline"><button class="go">Keep</button></form>')
+        acts.append(f'<form method="post" action="/job/{job_id}/skip" '
+                    f'style="display:inline"><button class="btn-quiet">Skip</button></form>')
+
+    desc = E((j.get("description") or "").strip())[:4000]
+
+    return page(f"""
+<div class="headline">
+  <h1>{E(j.get('company') or '?')}</h1>
+  <span class="chip {'act' if j['stage'] in ('found','waiting') else 'go'}">
+    {E(board.STAGE_LABEL[j['stage']])}</span>
+</div>
+<p class="dim">{E(j.get('title') or '')}{' · ' + E(j['location']) if j.get('location') else ''}
+{' · closes ' + E(j['deadline']) if j.get('deadline') else ''}</p>
+<div class="row-f">{"".join(acts)}<a class="btn btn-quiet" href="/">Back</a></div>
+
+<div class="stats">
+  {ui.stat("fit", f"{j.get('fit_score') or 0:.2f}")}
+  {ui.stat("route", E(j.get('apply_kind') or '-'))}
+  {ui.stat("waiting", (str(board._days_since(j.get('submitted_at'))) + "d") if j.get('submitted_at') else "-")}
+</div>
+<p class="sm dim" style="margin-top:10px">Scored because: {E(j.get('fit_reason') or 'no signals')}</p>
+
+<h3>What happened</h3>
+<ul class="tl">{tl or '<li>Found in your mail.</li>'}</ul>
+{src}
+<h3>The posting</h3>
+<div class="card sm" style="white-space:pre-wrap;max-height:420px;overflow:auto">{desc or 'No text captured.'}</div>
+""", "Board", BOARD_JS)
+
+
+@app.post("/job/{job_id}/keep")
+def job_keep(job_id: int):
+    board.set_triage(job_id, "shortlisted")
+    return RedirectResponse("/?stage=found", status_code=303)
+
+
+@app.post("/job/{job_id}/skip")
+def job_skip(job_id: int):
+    board.set_triage(job_id, "skipped")
+    return RedirectResponse("/?stage=found", status_code=303)
+
+
+@app.post("/sender/mute")
+def sender_mute(addr: str = Form(...), back: str = Form("/")):
+    from urllib.parse import quote
+    triage.mute(addr)
+    return RedirectResponse(f"{back}?saved={quote(f'Muted {addr}. Nothing from that address will be shown again.')}",
+                            status_code=303)
+
+
+@app.post("/sender/unmute")
+def sender_unmute(addr: str = Form(...)):
+    from urllib.parse import quote
+    triage.unmute(addr)
+    return RedirectResponse(f"/setup?saved={quote(f'{addr} will be judged on merit again.')}#senders",
+                            status_code=303)
+
+
+# ================================================================== drafts
+
+DRAFT_SQL = """
+SELECT a.id, a.status, a.job_id, a.channel, d.subject, d.body, d.id draft_id,
+       d.evidence_ids, j.title, j.fit_score, co.name company_name,
+       c.email to_email, c.name to_name, c.verified, r.path resume_path
+  FROM applications a
+  JOIN drafts d ON d.id = a.draft_id
+  JOIN jobs j ON j.id = a.job_id
+  LEFT JOIN companies co ON co.id = j.company_id
+  LEFT JOIN contacts c ON c.id = d.contact_id
+  LEFT JOIN resumes r ON r.id = a.resume_id
 """
 
-JS = """
+
+@app.get("/draft/{app_id}", response_class=HTMLResponse)
+def draft_page(app_id: int):
+    r = rows(DRAFT_SQL + " WHERE a.id = ?", (app_id,))
+    if not r:
+        return page(ui.note("No such draft.", "bad"), "Board")
+    a = r[0]
+    warn = ""
+    if not a["to_email"]:
+        warn = ui.note("No recipient address, so this one will be blocked at send.", "bad")
+    elif not a["verified"]:
+        warn = ui.note("This address was never verified. The mailer refuses "
+                       "unverified addresses, because a bounce costs sender "
+                       "reputation and you cannot buy that back.", "bad")
+    if "FILL" in (a["body"] or ""):
+        warn += ui.note("This draft still has a FILL placeholder in it. Fix the "
+                        "evidence lines on <a href='/setup#profile'>Setup</a>.", "bad")
+
+    nxt = rows("SELECT a.id FROM applications a JOIN jobs j ON j.id=a.job_id"
+               " WHERE a.status='needs_review' AND a.id != ?"
+               " ORDER BY j.fit_score DESC LIMIT 1", (app_id,))
+
+    return page(f"""
+<div class="headline"><h1>{E(a['company_name'] or '?')}</h1>
+  <span class="chip {'act' if a['status'] == 'needs_review' else 'go'}">{E(a['status'])}</span></div>
+<p class="dim sm">{E(a['title'] or '')} · to {E(a['to_email'] or 'nobody')} ·
+resume {E(Path(a['resume_path']).name if a['resume_path'] else 'none')}</p>
+{warn}
+<form method="post" action="/draft/{app_id}/save" id="editform">
+  <label class="f" for="subject">Subject</label>
+  <input type="text" id="subject" name="subject" value="{E(a['subject'] or '')}">
+  <label class="f" for="body">Message</label>
+  <textarea id="body" name="body">{E(a['body'] or '')}</textarea>
+  <div class="row-f">
+    <button class="go" type="submit" name="action" value="approve">Approve</button>
+    <button type="submit">Save</button>
+    <button class="btn-bad" type="submit" name="action" value="reject">Reject</button>
+    {f'<a class="btn" href="/draft/{nxt[0]["id"]}">Next waiting</a>' if nxt else ''}
+    <a class="btn btn-quiet" href="/">Back to board</a>
+  </div>
+</form>
+<p class="sm dim">Approving only marks it ready. Sending is a separate step on
+<a href="/setup#run">Setup</a>, and it dry runs first.</p>
+""", "Board", """<script>
+document.addEventListener('keydown', e => {
+  if ((e.metaKey||e.ctrlKey) && e.key === 's') {
+    e.preventDefault(); document.getElementById('editform').submit(); }
+});</script>""")
+
+
+@app.post("/draft/{app_id}/save")
+def draft_save(app_id: int, subject: str = Form(""), body: str = Form(""),
+               action: str = Form("")):
+    with db.tx() as c:
+        row = c.execute("SELECT draft_id, job_id FROM applications WHERE id=?",
+                        (app_id,)).fetchone()
+        if row:
+            c.execute("UPDATE drafts SET subject=?, body=?, edited=1 WHERE id=?",
+                      (subject.strip(), body.strip(), row["draft_id"]))
+        if action in ("approve", "reject"):
+            c.execute("UPDATE applications SET status=? WHERE id=?",
+                      ("approved" if action == "approve" else "rejected", app_id))
+    if action and row:
+        db.log("application", app_id, action)
+        board.record(row["job_id"], action, "by you", app_id)
+    return RedirectResponse("/" if action else f"/draft/{app_id}", status_code=303)
+
+
+# ================================================================== activity
+
+@app.get("/activity", response_class=HTMLResponse)
+def activity():
+    from core import track
+    rep = track.report()
+    c = db.counts()
+    bc = board.counts()
+    sst = triage.sender_stats()
+
+    cards = "".join([
+        ui.stat("found", c.get("jobs", 0)),
+        ui.stat("applied", bc["applied"] + bc["waiting"] + bc["replied"], "go"),
+        ui.stat("replies", rep["replies"], "good" if rep["replies"] else ""),
+        ui.stat("reply rate", f"{rep['reply_rate']*100:.0f}%"),
+        ui.stat("waiting", bc["waiting"], "act" if bc["waiting"] else ""),
+        ui.stat("sent today", c.get("sent_today", 0)),
+        ui.stat("muted senders", sst["not_job"]),
+        ui.stat("form maps", c.get("form_maps", 0)),
+    ])
+
+    hist = rows(
+        "SELECT t.kind, t.detail, t.at, j.title, co.name company, j.id job_id"
+        "  FROM timeline t LEFT JOIN jobs j ON j.id=t.job_id"
+        "  LEFT JOIN companies co ON co.id=j.company_id"
+        " ORDER BY t.id DESC LIMIT 80")
+    def _hist_row(h):
+        co = E(h.get("company") or "?")
+        link = f'<a href="/job/{h["job_id"]}">{co}</a>' if h.get("job_id") else co
+        return (f'<tr><td class="dim mono sm">{E((h.get("at") or "")[:16])}</td>'
+                f'<td>{E(h["kind"].replace("_", " ").title())} '
+                f'<span class="dim sm">{E(h.get("detail") or "")}</span></td>'
+                f'<td>{link}<div class="dim sm">{E(h.get("title") or "")}</div>'
+                f'</td></tr>')
+
+    if hist:
+        body = ('<div class="scroll"><table><tr><th>when</th><th>what</th>'
+                '<th>company</th></tr>'
+                + "".join(_hist_row(h) for h in hist) + "</table></div>")
+    else:
+        body = ui.empty("Nothing has happened yet",
+                        "Scan your mail and this fills in as you go.")
+
+    return page(f'<div class="headline"><h1>Activity</h1></div>'
+                f'<div class="stats">{cards}</div>'
+                f'<h2>Everything that happened</h2>{body}', "Activity")
+
+
+# ================================================================== setup
+
+def _setup_checks():
+    from core.config import path, profile, flat_profile
+    from core import llm
+    out = []
+    p = path("assets", "resume_default.pdf")
+    out.append(("Resume", p.exists(),
+                "The file that gets attached and uploaded.", "#files"))
+    OPT = {"gender", "portfolio"}
+    blanks = [k for k, v in flat_profile().items() if not v and k not in OPT]
+    out.append(("Your details", not blanks,
+                f"Missing: {', '.join(blanks)}" if blanks else "All filled in.",
+                "#profile"))
+    ev = profile().get("evidence") or []
+    fills = [e["id"] for e in ev if "FILL" in (e.get("line") or "")]
+    out.append((f"Evidence lines ({len(ev)-len(fills)} of {len(ev)})", not fills,
+                f"Still placeholders: {', '.join(fills)}" if fills
+                else "These are the only claims the drafter may make about you.",
+                "#profile"))
+    out.append(("Google client file", path("secrets", "credentials.json").exists(),
+                "Needed to read your mail. Filling forms does not need it.", "#gmail"))
+    out.append(("Gmail read access", path("secrets", "token.json").exists(),
+                "Lets it scan your mail for openings.", "#gmail"))
+    out.append(("Gmail send access", path("secrets", "token_send.json").exists(),
+                "Only needed if you want it to send outreach.", "#gmail"))
+    return out
+
+
+@app.get("/setup", response_class=HTMLResponse)
+def setup(saved: str = "", error: str = "", run: str = "", start: str = ""):
+    checks = _setup_checks()
+    todo = sum(1 for _, ok, _, _ in checks if not ok)
+    rowsh = "".join(
+        f'<tr><td>{"<span class=chip go>done</span>" if ok else "<span class=chip act>to do</span>"}</td>'
+        f'<td><b>{E(label)}</b><div class="dim sm">{hint}</div></td>'
+        f'<td style="text-align:right"><a class="btn sm" href="{href}">'
+        f'{"change" if ok else "fix"}</a></td></tr>'
+        for label, ok, hint, href in checks)
+
+    slots = "".join(
+        f'''<div class="card">
+  <h4>{E(s["label"])} {"<span class=chip go>have it</span>" if s["exists"]
+      else "<span class=chip act>missing</span>"}</h4>
+  <p>{E(s["desc"])}</p>
+  <form method="post" action="/files/upload" enctype="multipart/form-data">
+    <input type="hidden" name="key" value="{s["key"]}">
+    <input type="file" name="f" accept="{s["accept"]}" required
+           style="font-size:12px;max-width:100%" id="up_{s["key"]}">
+    <div class="row-f"><button class="go sm">
+      {"Replace" if s["exists"] else "Upload"}</button></div>
+  </form>
+</div>''' for s in files.slot_state())
+
+    gm = "".join(
+        f'''<div class="card"><h4>{E(g["label"])}
+  {"<span class=chip go>connected</span>" if g["connected"]
+   else "<span class=chip act>not connected</span>"}</h4>
+  <p>{E(g["why"])}</p>
+  {f'<form method="post" action="/gmail/disconnect" style="display:inline">'
+     f'<input type=hidden name=which value="{g["which"]}">'
+     f'<button class="btn-quiet sm">Disconnect</button></form>'
+   if g["connected"] else
+   (f'<a class="btn btn-go sm" href="/gmail/start?which={g["which"]}">Connect</a>'
+    if gmail_oauth.CREDS.exists()
+    else '<span class="dim sm">Upload the client file first</span>')}
+</div>''' for g in gmail_oauth.status())
+
+    d = profileform.parsed()
+    blankset = set(profileform.blanks())
+    fields = []
+    for section, defs in profileform.FIELDS.items():
+        inner = "".join(
+            f'<label class="f" for="f_{section}_{k}">{E(lab)}'
+            f'{" <span class=chip act>needed</span>" if f"{section}.{k}" in blankset else ""}'
+            f'</label><input type="text" id="f_{section}_{k}" name="{section}.{k}" '
+            f'value="{E(str((d.get(section) or {}).get(k) or ""))}" placeholder="{E(ph)}">'
+            for k, lab, ph, _ in defs)
+        fields.append(f'<h3>{E(section)}</h3>{inner}')
+    evs = "".join(
+        f'<label class="f" for="ev_{e["id"]}">{E(e["id"])}'
+        f'{" <span class=chip act>placeholder</span>" if e["placeholder"] else ""}'
+        f'</label><textarea id="ev_{e["id"]}" name="ev.{e["id"]}" '
+        f'style="min-height:66px">{E(e["line"])}</textarea>'
+        for e in profileform.evidence_items())
+
+    muted = triage.muted_senders(60)
+    mrows = "".join(
+        f'<tr><td class="mono sm">{E(m["address"])}</td>'
+        f'<td class="dim sm">{E(m.get("reason") or "")}</td>'
+        f'<td class="dim sm mono">{m["seen"]}x</td>'
+        f'<td style="text-align:right"><form method="post" action="/sender/unmute" '
+        f'style="display:inline"><input type=hidden name=addr value="{E(m["address"])}">'
+        f'<button class="btn-quiet sm">Unmute</button></form></td></tr>'
+        for m in muted)
+
+    cfg = config()
+    edit_links = "".join(
+        f'<a class="btn sm" href="/settings/{k}">{E(v[0])}</a>'
+        for k, v in editor.EDITABLE.items())
+
+    def rc(job, title, desc, cls=""):
+        return (f'<div class="card"><h4>{title}</h4><p>{desc}</p>'
+                f'<button class="{cls} sm" data-job="{job}">Run</button></div>')
+
+    return page(f"""
+{flash(saved, error)}
+<div class="headline"><h1>Setup{"" if not todo else f" &middot; {todo} left"}</h1></div>
+<div class="scroll"><table>{rowsh}</table></div>
+
+<h2 id="run">Run something</h2>
+<div class="row-f">
+  <span id="runstatus" class="dim sm">idle</span><div class="grow"></div>
+  <button class="btn-quiet sm" onclick="stopRun()">Stop</button>
+</div>
+<div id="log" class="dim">Output appears here.</div>
+<div class="cards">
+  {rc("find", "Scan my mail", "Search your whole mailbox for openings, score them, add them to the board.", "go")}
+  {rc("draft", "Write outreach", "Draft a mail for every kept job that has a verified address.")}
+  {rc("followup", "Queue follow ups", "One per application, a week after sending, only if nobody replied.")}
+  {rc("send_dry", "Preview sending", "Shows exactly what would go out. Sends nothing.")}
+  {rc("send_live", "Send for real", "Only approved drafts, only within today's cap.", "btn-bad")}
+  {rc("track", "Check for replies", "Reads the threads you sent on and records what came back.")}
+  {rc("doctor", "Check the setup", "What is missing and what each gap costs you.")}
+  {rc("tests", "Run the tests", "111 checks, mostly that the guards still refuse things.")}
+</div>
+{ui.note("Sending for real is refused while <span class='mono'>dry_run</span> is on in "
+         "<a href='/settings/config'>config</a>. That is the second switch, on purpose.", "act")
+ if cfg["safety"].get("dry_run", True) else ""}
+
+<h2 id="files">Files</h2>
+<div class="cards">{slots}</div>
+
+<h2 id="gmail">Gmail</h2>
+<p class="sm dim">Two separate connections. Read and send are different scopes in
+different files, so a bug in the scanner cannot send and a bug in the mailer
+cannot read.</p>
+<div class="cards">{gm}</div>
+<details><summary class="sm dim" style="cursor:pointer;margin:10px 0">
+  How to get the client file</summary>
+<div class="card sm mono" style="white-space:pre-wrap;margin-top:8px">1. console.cloud.google.com -> new project
+2. APIs and Services -> Library -> enable Gmail API
+3. Google Auth Platform -> Get started -> External
+4. Google Auth Platform -> Audience -> add yourself as a Test user
+5. Google Auth Platform -> Clients -> Create client -> Desktop app
+6. Download the JSON and upload it above
+
+Pick Desktop app, not Web application.
+Once it works, Audience -> Publish app, or tokens expire every 7 days.</div>
+</details>
+
+<h2 id="profile">Your details</h2>
+<p class="sm dim">What the form filler types and what the drafter is allowed to
+cite. Saving edits profile.yaml in place, so its comments survive.</p>
+<form method="post" action="/profile" id="editform">
+  {"".join(fields)}
+  <h3>evidence</h3>
+  <p class="sm dim">The drafter picks the two whose tags best match a posting.
+  Anything still marked placeholder is skipped rather than sent.</p>
+  {evs}
+  <div class="row-f"><button class="go" type="submit">Save details</button>
+  <span class="dim sm">Cmd-S also saves</span></div>
+</form>
+
+<h2 id="senders">Muted senders</h2>
+<p class="sm dim">Senders you told it to ignore. Nothing from these reaches the
+board, and judging one costs nothing ever again. Your decisions here outrank
+every rule the scanner has.</p>
+{f'<div class="scroll"><table><tr><th>address</th><th>why</th><th>seen</th><th></th></tr>{mrows}</table></div>'
+ if muted else ui.empty("Nothing muted yet",
+   "Open a job, and Never show this sender again mutes it from there.")}
+
+<h2>Config files</h2>
+<p class="sm dim">Validated before anything is written, and the previous version
+is always kept in data/backups.</p>
+<div class="row-f">{edit_links}</div>
+""", "Setup", RUN_JS + (f"<script>autoStart('{E(start)}','{E(run)}')</script>"
+                        if (start or run) else ""))
+
+
+RUN_JS = """
+<script>
 let poll=null, curRun=null;
-function el(i){return document.getElementById(i)}
+const el=i=>document.getElementById(i);
 function paint(lines){
   const L=el('log'); if(!L) return;
   L.innerHTML = lines.map(t=>{
     const e=t.replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
-    if(/\\[error\\]|FAIL|Traceback|error:|\\bXX\\b|!/.test(t)) return '<span class="err">'+e+'</span>';
-    if(/\\bok\\b|passed|SENT|\\[ok\\]/.test(t)) return '<span class="ok">'+e+'</span>';
-    if(/blocked|needs you|warn|DRY RUN/.test(t)) return '<span class="warn">'+e+'</span>';
+    if(/\\[error\\]|FAIL|Traceback|error:|\\bXX\\b|!/.test(t)) return '<span class="e">'+e+'</span>';
+    if(/\\bok\\b|passed|SENT|\\[ok\\]|saved/.test(t)) return '<span class="g">'+e+'</span>';
+    if(/blocked|needs you|DRY RUN|to do/.test(t)) return '<span class="w">'+e+'</span>';
     return e;
   }).join('\\n');
-  L.scrollTop = L.scrollHeight;
+  L.scrollTop=L.scrollHeight;
 }
-function setStatus(txt, cls){
-  const s=el('runstatus'); if(s) s.innerHTML='<span class="dot '+cls+'"></span>'+txt;
-}
+function status(t,c){const s=el('runstatus');
+  if(s) s.innerHTML='<span class="dot '+c+'"></span>'+t;}
 async function tick(){
   if(!curRun) return;
-  const r = await fetch('/api/run/'+curRun); if(!r.ok) return;
-  const d = await r.json();
-  paint(d.lines);
-  if(d.awaiting_release){
-    setStatus(d.label+' - browser open, waiting for you','run');
-    el('doneBtn').style.display='inline-block';
-  } else if(d.done){
-    clearInterval(poll); poll=null;
-    setStatus(d.label+' - finished'+(d.code?' (exit '+d.code+')':''), d.code?'err':'ok');
-    el('doneBtn').style.display='none';
+  const r=await fetch('/api/run/'+curRun); if(!r.ok) return;
+  const d=await r.json(); paint(d.lines);
+  if(d.awaiting_release){ status(d.label+' — browser open, waiting for you','run');
+    let b=el('doneBtn'); if(!b){ b=document.createElement('button');
+      b.id='doneBtn'; b.className='go sm'; b.textContent='Done, close the browser';
+      b.onclick=()=>{fetch('/api/run/'+curRun+'/release',{method:'POST'});b.remove();};
+      el('runstatus').after(b);} }
+  else if(d.done){ clearInterval(poll); poll=null;
+    status(d.label+(d.code?' — failed (exit '+d.code+')':' — done'), d.code?'err':'ok');
     document.querySelectorAll('button[data-job]').forEach(b=>b.disabled=false);
-    if(el('refreshAfter')) setTimeout(()=>{ if(d.code===0) location.reload(); }, 900);
-  } else {
-    setStatus(d.label+' - running','run');
-  }
+    el('doneBtn')?.remove(); }
+  else status(d.label+' — running','run');
 }
-async function run(job, extra){
+function watch(id){ curRun=id; if(poll) clearInterval(poll);
+  poll=setInterval(tick,700); tick(); }
+async function run(job){
   document.querySelectorAll('button[data-job]').forEach(b=>b.disabled=true);
   paint(['starting '+job+' ...']);
-  const body = new URLSearchParams(); if(extra) body.set('extra', extra);
-  const r = await fetch('/api/run/'+job, {method:'POST', body});
+  const r=await fetch('/api/run/'+job,{method:'POST'});
   if(!r.ok){ paint(['could not start: '+await r.text()]);
     document.querySelectorAll('button[data-job]').forEach(b=>b.disabled=false); return; }
-  const d = await r.json(); curRun=d.run_id;
-  if(poll) clearInterval(poll); poll=setInterval(tick,700); tick();
+  watch((await r.json()).run_id);
 }
-async function fillUrl(){
-  const u=el('fillurl').value.trim(); if(!u) return;
-  document.querySelectorAll('button[data-job]').forEach(b=>b.disabled=true);
-  const body=new URLSearchParams(); body.set('url',u);
-  const r=await fetch('/api/fill',{method:'POST',body});
-  const d=await r.json(); curRun=d.run_id;
-  if(poll) clearInterval(poll); poll=setInterval(tick,700); tick();
+function stopRun(){ if(curRun) fetch('/api/run/'+curRun+'/stop',{method:'POST'}); }
+function autoStart(job,runId){
+  if(runId){ watch(runId); document.getElementById('run')?.scrollIntoView(); return; }
+  if(job){ run(job); document.getElementById('run')?.scrollIntoView(); }
 }
-async function done(){
-  if(!curRun) return;
-  await fetch('/api/run/'+curRun+'/release',{method:'POST'});
-  el('doneBtn').style.display='none';
-}
-async function stopRun(){ if(curRun) await fetch('/api/run/'+curRun+'/stop',{method:'POST'}); }
-document.addEventListener('keydown',e=>{
-  if((e.metaKey||e.ctrlKey)&&e.key==='s'){const f=el('editform'); if(f){e.preventDefault();f.submit();}}
+document.addEventListener('click',e=>{
+  const b=e.target.closest('button[data-job]'); if(b) run(b.dataset.job);
 });
-"""
-
-TABS = [("/", "queue"), ("/run", "run"), ("/review", "review"),
-        ("/applications", "applications"), ("/profile", "profile"),
-        ("/files", "files"), ("/gmail", "gmail"), ("/settings", "settings"),
-        ("/setup", "setup"), ("/stats", "stats")]
-
-
-def page(body: str, tab: str = "", with_js: bool = False) -> HTMLResponse:
-    nav = "".join(f'<a href="{href}"{" class=on" if name == tab else ""}>{name}</a>'
-                  for href, name in TABS)
-    c = db.counts()
-    badge = ""
-    if c.get("app:needs_review"):
-        badge = (f'<span class="pill p-needs_review">{c["app:needs_review"]} '
-                 f'waiting</span>')
-    js = f"<script>{JS}</script>" if with_js else ""
-    return HTMLResponse(f"""<!doctype html><html><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>jobbot</title><style>{CSS}</style></head><body><div class="wrap">
-<header><h1>jobbot</h1><nav>{nav}</nav><div class="spacer"></div>{badge}</header>
-{body}</div>{js}</body></html>""")
+document.addEventListener('keydown',e=>{
+  if((e.metaKey||e.ctrlKey)&&e.key==='s'){const f=el('editform');
+    if(f){e.preventDefault();f.submit();}}
+});
+</script>"""
 
 
-def stat(label, value, hot=False):
-    return (f'<div class="stat{" hot" if hot else ""}"><b>{value}</b>'
-            f'<span>{label}</span></div>')
+# ================================================================== actions
+
+@app.post("/profile")
+async def profile_save(request: Request):
+    from urllib.parse import quote
+    form = await request.form()
+    text = profileform.read()
+    try:
+        cur = {e["id"]: e["line"] for e in profileform.evidence_items()}
+        for k, v in form.items():
+            if k.startswith("ev."):
+                if cur.get(k[3:]) != " ".join(str(v).split()):
+                    text = profileform.set_evidence(text, k[3:], str(v))
+            elif "." in k:
+                section, key = k.split(".", 1)
+                if section in profileform.FIELDS:
+                    text = profileform.set_scalar(text, section, key, str(v))
+    except KeyError as e:
+        return RedirectResponse(f"/setup?error={quote(str(e))}#profile", status_code=303)
+    ok, msg = profileform.save(text)
+    q = f"saved={quote(msg)}" if ok else f"error={quote(msg)}"
+    return RedirectResponse(f"/setup?{q}#profile", status_code=303)
 
 
-LOG_PANEL = """
-<div class="row">
-  <span id="runstatus" class="small dim">idle</span>
-  <div class="spacer"></div>
-  <button id="doneBtn" onclick="done()" class="go" style="display:none">
-    Done, close the browser</button>
-  <button onclick="stopRun()" class="no">stop</button>
-</div>
-<div id="log" class="dim">Output appears here.</div>
-"""
+@app.post("/files/upload")
+async def files_upload(key: str = Form(...), f: UploadFile = File(...)):
+    from urllib.parse import quote
+    try:
+        msg = files.save_slot(key, await f.read())
+        return RedirectResponse(f"/setup?saved={quote(msg)}#files", status_code=303)
+    except files.Rejected as e:
+        return RedirectResponse(f"/setup?error={quote(str(e))}#files", status_code=303)
 
 
-# ------------------------------------------------------------------ queue
-
-@app.get("/", response_class=HTMLResponse)
-def queue(all: int = 0):
-    floor = 0.0 if all else float(config()["scoring"].get("min_fit_to_draft", 0.55))
-    js = rows(
-        "SELECT j.id, j.title, j.fit_score, j.fit_reason, j.location, j.apply_kind,"
-        "       j.apply_url, j.apply_email, j.deadline, co.name company,"
-        "       ap.status, ap.id app_id"
-        "  FROM jobs j LEFT JOIN companies co ON co.id=j.company_id"
-        "  LEFT JOIN applications ap ON ap.job_id=j.id"
-        " WHERE j.fit_score >= ? ORDER BY j.fit_score DESC, j.id DESC LIMIT 200", (floor,))
-    c = db.counts()
-    head = '<div class="stats">' + "".join([
-        stat("jobs", c.get("jobs", 0)),
-        stat("unparsed", c.get("raw_unprocessed", 0), c.get("raw_unprocessed", 0) > 0),
-        stat("needs review", c.get("app:needs_review", 0), c.get("app:needs_review", 0) > 0),
-        stat("approved", c.get("app:approved", 0)),
-        stat("sent today", c.get("sent_today", 0)),
-        stat("cap", config()["limits"]["emails_per_day"]),
-    ]) + "</div>"
-
-    trs = []
-    for j in js:
-        pct = int((j["fit_score"] or 0) * 100)
-        status = (f'<span class="pill p-{j["status"]}">{j["status"]}</span>'
-                  if j["status"] else "")
-        acts = []
-        if j["apply_url"]:
-            acts.append(f'<button data-job="fill" onclick="run_fill(\'{j["id"]}\')">'
-                        f'fill</button>')
-            acts.append(f'<a class="btn" href="{j["apply_url"]}" target="_blank" '
-                        f'rel="noopener">open</a>')
-        if j["app_id"]:
-            acts.append(f'<a class="btn" href="/review/{j["app_id"]}">draft</a>')
-        trs.append(
-            f'<tr><td class="n">{j["id"]}</td>'
-            f'<td class="n"><div class="bar"><i style="width:{pct}%"></i></div>'
-            f'<span class="small dim">{j["fit_score"]:.2f}</span></td>'
-            f'<td><b>{j["company"] or "?"}</b><br>'
-            f'<span class="small dim">{j["fit_reason"] or ""}</span></td>'
-            f'<td>{j["title"] or ""}<br><span class="small dim">'
-            f'{j["location"] or ""}{" · " + j["deadline"] if j["deadline"] else ""}'
-            f'{" · " + j["apply_email"] if j["apply_email"] else ""}</span></td>'
-            f'<td class="small">{j["apply_kind"] or "-"}</td>'
-            f'<td>{status}</td><td class="n">{" ".join(acts)}</td></tr>')
-
-    toggle = ('<a class="btn" href="/">only good fits</a>' if all
-              else '<a class="btn" href="/?all=1">show everything</a>')
-    empty = ('<tr><td colspan=7 class="dim">Nothing yet. '
-             'Go to <a href="/run">run</a> and press Find openings.</td></tr>')
-    return page(head + f"""
-<div class="row">
-  <button data-job onclick="run('find')" class="primary">Find new openings</button>
-  <button data-job onclick="run('draft')">Draft outreach</button>
-  <span id="refreshAfter"></span>
-  {toggle}
-</div>
-{LOG_PANEL}
-<h2>Job queue</h2>
-<table><tr><th>id</th><th>fit</th><th>company</th><th>role</th><th>via</th>
-<th>status</th><th></th></tr>{"".join(trs) or empty}</table>
-<script>
-function run_fill(id){{ fetch('/api/fill_job/'+id,{{method:'POST'}})
-  .then(r=>r.json()).then(d=>{{ curRun=d.run_id;
-    if(poll) clearInterval(poll); poll=setInterval(tick,700); tick(); }}); }}
-</script>
-""", "queue", with_js=True)
+@app.get("/gmail/start")
+def gmail_start(request: Request, which: str = "read"):
+    from urllib.parse import quote
+    try:
+        url = gmail_oauth.start(which, str(request.url_for("gmail_callback")))
+    except gmail_oauth.OAuthError as e:
+        return RedirectResponse(f"/setup?error={quote(str(e))}#gmail", status_code=303)
+    return RedirectResponse(url, status_code=303)
 
 
-# ------------------------------------------------------------------ run
-
-@app.get("/run", response_class=HTMLResponse)
-def run_page(show: str = ""):
-    def card(job, title, desc, cls=""):
-        return (f'<div class="card"><h4>{title}</h4><p>{desc}</p>'
-                f'<button data-job="{job}" class="{cls}" onclick="run(\'{job}\')">'
-                f'run</button></div>')
-
-    cfg = config()
-    live_warn = ""
-    if cfg["safety"].get("dry_run", True):
-        live_warn = ('<div class="note">Live send is refused while '
-                     '<span class="mono">safety.dry_run</span> is true in config. '
-                     'That is the second switch, and it is on purpose. Change it in '
-                     '<a href="/settings/config">settings</a> when you have read '
-                     'ten drafts.</div>')
-
-    recent = runner.recent(8)
-    rec = "".join(
-        f'<tr><td class="small mono">{r["id"]}</td><td class="small">{r["label"]}</td>'
-        f'<td>{"<span class=pill p-approved>done</span>" if r["done"] and not r["code"] else ("<span class=pill p-rejected>exit " + str(r["code"]) + "</span>" if r["done"] else "<span class=pill p-needs_review>running</span>")}</td>'
-        f'<td class="small dim n">{time.strftime("%H:%M:%S", time.localtime(r["started"]))}</td>'
-        f'<td class="n"><a class="btn" href="/run?show={r["id"]}">log</a></td></tr>'
-        for r in recent)
-
-    replay = ""
-    if show:
-        r = runner.get(show)
-        if r:
-            body = "\n".join(r["lines"]) or "(no output)"
-            state = "finished" if r["done"] else "running"
-            code = f" exit {r['code']}" if r["done"] and r["code"] else ""
-            esc = body.replace("&", "&amp;").replace("<", "&lt;")
-            replay = (f'<h2>{r["label"]}</h2>'
-                      f'<p class="small dim mono">{r["cmd"]} &middot; {state}{code}</p>'
-                      f'<pre>{esc}</pre>'
-                      f'<div class="row"><a class="btn" href="/run">back to controls</a></div>')
-        else:
-            replay = ('<div class="note">That run is gone. Runs are kept in memory '
-                      'only, so restarting the dashboard clears them.</div>')
-
-    return page(replay + f"""
-<h2>Fill a form</h2>
-<p class="small dim">Paste any application URL. A browser opens, every field it
-recognises gets typed in, and it waits. It never presses submit.</p>
-<div class="row">
-  <input type="url" id="fillurl" placeholder="https://boards.greenhouse.io/..."
-         style="max-width:560px" onkeydown="if(event.key==='Enter')fillUrl()">
-  <button data-job onclick="fillUrl()" class="primary">Fill it</button>
-</div>
-
-{LOG_PANEL}
-
-<h2>Find</h2>
-<div class="grid">
-  {card("find", "Find new openings", "Collect from Gmail and WhatsApp, parse, score. The daily one.", "primary")}
-  {card("collect", "Collect only", "Pull new mail into the raw table, parse nothing.")}
-  {card("extract", "Parse pending", "Turn raw items into jobs. Uses the model for anything regex missed.")}
-  {card("extract_norm", "Parse, regex only", "Same, no model calls. Use when you are near your plan limit.")}
-  {card("rescore", "Rescore everything", "After you change scoring rules in settings.")}
-</div>
-
-<h2>Mail</h2>
-{live_warn}
-<div class="grid">
-  {card("draft", "Draft outreach", "For every job above the fit floor that has a verified address.")}
-  {card("draft_tpl", "Draft from template", "Same, no model call. Predictable and instant.")}
-  {card("send_dry", "Dry run the queue", "Shows exactly what would go out. Sends nothing.")}
-  {card("send_live", "Send for real", "Only approved rows, only within today's cap.", "danger")}
-  {card("track", "Check for replies", "Reads the threads you sent on and records outcomes.")}
-</div>
-
-<h2>Housekeeping</h2>
-<div class="grid">
-  {card("doctor", "Check the setup", "What is missing and what each gap costs you.")}
-  {card("tests", "Run the tests", "41 checks, mostly that the guards still refuse things.")}
-  {card("status", "Counts per stage", "Where everything currently sits.")}
-</div>
-
-<h2>Recent runs</h2>
-<table><tr><th>id</th><th>what</th><th></th><th>started</th><th></th></tr>
-{rec or '<tr><td colspan=5 class="dim">Nothing run yet this session.</td></tr>'}</table>
-""", "run", with_js=True)
+@app.get("/gmail/callback", name="gmail_callback")
+def gmail_callback(request: Request, state: str = "", error: str = ""):
+    from urllib.parse import quote
+    if error:
+        return RedirectResponse(f"/setup?error={quote('Google returned: ' + error)}#gmail",
+                                status_code=303)
+    try:
+        msg = gmail_oauth.finish(state, str(request.url))
+    except gmail_oauth.OAuthError as e:
+        return RedirectResponse(f"/setup?error={quote(str(e))}#gmail", status_code=303)
+    return RedirectResponse(f"/setup?saved={quote(msg)}#gmail", status_code=303)
 
 
-# ------------------------------------------------------------------ run api
+@app.post("/gmail/disconnect")
+def gmail_disconnect(which: str = Form(...)):
+    from urllib.parse import quote
+    return RedirectResponse(
+        f"/setup?saved={quote(gmail_oauth.disconnect(which))}#gmail", status_code=303)
+
+
+@app.get("/settings/{key}", response_class=HTMLResponse)
+def settings_edit(key: str, saved: str = "", error: str = ""):
+    if key not in editor.EDITABLE:
+        return page(ui.note("Not editable.", "bad"), "Setup")
+    name, kind, desc = editor.EDITABLE[key]
+    bks = "".join(
+        f'<form method="post" action="/settings/{key}/restore" style="display:inline">'
+        f'<input type="hidden" name="stamp" value="{b["stamp"]}">'
+        f'<button class="sm">{b["stamp"]}</button></form> '
+        for b in editor.backups(key))
+    return page(f"""
+{flash(saved, error)}
+<div class="headline"><h1>{E(name)}</h1></div>
+<p class="sm dim">{E(desc)} Checked as {E(kind)} before anything is written.</p>
+<form method="post" action="/settings/{key}" id="editform">
+  <textarea class="tall" name="text" id="text" spellcheck="false">{E(editor.read(key))}</textarea>
+  <div class="row-f"><button class="go" type="submit">Save</button>
+    <a class="btn btn-quiet" href="/setup">Back</a>
+    <div class="grow"></div><span class="dim sm">Cmd-S saves</span></div>
+</form>
+{f'<h3>restore an earlier version</h3><div class="row-f">{bks}</div>' if bks else ''}
+""", "Setup", RUN_JS)
+
+
+@app.post("/settings/{key}")
+def settings_save(key: str, text: str = Form("")):
+    from urllib.parse import quote
+    if key not in editor.EDITABLE:
+        return RedirectResponse("/setup", status_code=303)
+    ok, msg = editor.save(key, text)
+    q = f"saved={quote(msg)}" if ok else f"error={quote(msg)}"
+    return RedirectResponse(f"/settings/{key}?{q}", status_code=303)
+
+
+@app.post("/settings/{key}/restore")
+def settings_restore(key: str, stamp: str = Form("")):
+    from urllib.parse import quote
+    ok, msg = editor.restore(key, stamp)
+    q = f"saved={quote(msg)}" if ok else f"error={quote(msg)}"
+    return RedirectResponse(f"/settings/{key}?{q}", status_code=303)
+
+
+# ================================================================== run api
 
 @app.post("/api/run/{job}")
-async def api_run(job: str, request: Request):
-    form = await request.form()
-    extra = str(form.get("extra") or "").strip()
+def api_run(job: str):
     try:
-        run_id = runner.start(job, shlexish(extra))
+        return {"run_id": runner.start(job)}
     except KeyError:
         return JSONResponse({"error": f"unknown job {job}"}, status_code=404)
-    return {"run_id": run_id}
-
-
-def shlexish(s: str) -> list[str]:
-    import shlex
-    return shlex.split(s) if s else []
 
 
 @app.get("/api/run/{run_id}")
 def api_run_status(run_id: str):
     r = runner.get(run_id)
-    if not r:
-        return JSONResponse({"error": "no such run"}, status_code=404)
-    return r
+    return r or JSONResponse({"error": "no such run"}, status_code=404)
 
 
 @app.post("/api/run/{run_id}/release")
@@ -441,16 +836,6 @@ def api_stop(run_id: str):
     return {"stopped": runner.stop(run_id)}
 
 
-@app.post("/api/fill")
-async def api_fill(request: Request):
-    form = await request.form()
-    url = str(form.get("url") or "").strip()
-    if not url.startswith(("http://", "https://")):
-        return JSONResponse({"error": "not a url"}, status_code=400)
-    run_id, _ = runner.start_fill(url)
-    return {"run_id": run_id}
-
-
 @app.post("/api/fill_job/{job_id}")
 def api_fill_job(job_id: int):
     r = rows("SELECT apply_url FROM jobs WHERE id=?", (job_id,))
@@ -458,625 +843,5 @@ def api_fill_job(job_id: int):
         return JSONResponse({"error": "no apply url"}, status_code=404)
     run_id, _ = runner.start_fill(r[0]["apply_url"])
     db.log("job", job_id, "fill_launched", url=r[0]["apply_url"])
+    board.record(job_id, "filling", "form opened")
     return {"run_id": run_id}
-
-
-# ------------------------------------------------------------------ review
-
-REVIEW_SQL = """
-SELECT a.id, a.status, a.job_id, d.subject, d.body, d.id draft_id, d.evidence_ids,
-       j.title, j.fit_score, j.apply_url, co.name company_name,
-       c.email to_email, c.name to_name, c.verified, r.path resume_path
-  FROM applications a
-  JOIN drafts d ON d.id=a.draft_id
-  JOIN jobs j ON j.id=a.job_id
-  LEFT JOIN companies co ON co.id=j.company_id
-  LEFT JOIN contacts c ON c.id=d.contact_id
-  LEFT JOIN resumes r ON r.id=a.resume_id
-"""
-
-
-@app.get("/review", response_class=HTMLResponse)
-def review_list(status: str = "needs_review"):
-    apps = rows(REVIEW_SQL + " WHERE a.status=? ORDER BY j.fit_score DESC", (status,))
-    tabs = " ".join(
-        f'<a class="btn" href="/review?status={s}">{s.replace("_"," ")}</a>'
-        for s in ("needs_review", "approved", "rejected", "submitted"))
-    if not apps:
-        return page(f'<div class="row">{tabs}</div>'
-                    f'<div class="note info">Nothing with status {status}. '
-                    f'Draft some from <a href="/run">run</a>.</div>', "review", True)
-    trs = "".join(
-        f'<tr><td class="n">{a["id"]}</td><td class="n">{a["fit_score"]:.2f}</td>'
-        f'<td><b>{a["company_name"]}</b><br>'
-        f'<span class="small dim">{a["title"]}</span></td>'
-        f'<td class="small">{a["to_email"] or "<i>no address</i>"}'
-        f'{"" if a["verified"] else " <span class=pill p-rejected>unverified</span>"}</td>'
-        f'<td class="small">{Path(a["resume_path"]).name if a["resume_path"] else "-"}</td>'
-        f'<td class="n"><a class="btn" href="/review/{a["id"]}">read</a></td></tr>'
-        for a in apps)
-    bulk = ""
-    if status == "needs_review":
-        bulk = ('<form method="post" action="/review/approve_all" class="inline">'
-                '<button class="go">approve all ' + str(len(apps)) + '</button></form>')
-    return page(f'<div class="row">{tabs}<div class="spacer"></div>{bulk}</div>'
-                f'<h2>{status.replace("_"," ")} ({len(apps)})</h2><table>'
-                f'<tr><th>app</th><th>fit</th><th>company</th><th>to</th>'
-                f'<th>resume</th><th></th></tr>{trs}</table>', "review", True)
-
-
-@app.get("/review/{app_id}", response_class=HTMLResponse)
-def review_one(app_id: int):
-    r = rows(REVIEW_SQL + " WHERE a.id=?", (app_id,))
-    if not r:
-        return page('<div class="note bad">Not found.</div>', "review", True)
-    a = r[0]
-    ev = ", ".join(json.loads(a["evidence_ids"] or "[]")) or "-"
-    warn = ""
-    if not a["to_email"]:
-        warn = ('<div class="note bad">No recipient address. The mailer will '
-                'block this one.</div>')
-    elif not a["verified"]:
-        warn = ('<div class="note bad">Contact is unverified. The mailer refuses '
-                'unverified addresses, because a bounce costs sender reputation '
-                'and you cannot buy that back.</div>')
-    elif a["resume_path"] and not Path(a["resume_path"]).exists():
-        warn = (f'<div class="note">Resume missing at '
-                f'<span class="mono">{a["resume_path"]}</span>. The mail would go '
-                f'out with no attachment.</div>')
-    if "FILL" in (a["body"] or ""):
-        warn += ('<div class="note bad">This draft still contains a FILL '
-                 'placeholder. Fix the evidence lines in '
-                 '<a href="/settings/profile">profile</a>.</div>')
-
-    nxt = rows("SELECT a.id FROM applications a JOIN jobs j ON j.id=a.job_id"
-               " WHERE a.status='needs_review' AND a.id != ?"
-               " ORDER BY j.fit_score DESC LIMIT 1", (app_id,))
-    nxt_btn = (f'<a class="btn" href="/review/{nxt[0]["id"]}">next waiting</a>'
-               if nxt else "")
-
-    return page(f"""
-<h2>{a["company_name"]} &middot; {a["title"]}</h2>
-<p class="small dim">application {a["id"]} &middot; status {a["status"]} &middot;
-fit {a["fit_score"]:.2f} &middot; to {a["to_email"] or "none"} &middot;
-evidence {ev} &middot;
-resume {Path(a["resume_path"]).name if a["resume_path"] else "none"}</p>
-{warn}
-<form method="post" action="/review/{a["id"]}/save" id="editform">
-  <label class="f">subject</label>
-  <input type="text" name="subject" value="{(a["subject"] or "").replace('"','&quot;')}">
-  <label class="f">body</label>
-  <textarea name="body" class="short">{a["body"] or ""}</textarea>
-  <div class="row">
-    <button type="submit">save edits</button>
-    <button type="submit" class="go" name="action" value="approve">save and approve</button>
-    <button type="submit" class="no" name="action" value="reject">reject</button>
-    {nxt_btn}
-    <a class="btn" href="/review">back to list</a>
-  </div>
-</form>
-<p class="small dim">Approving only marks the row. Sending is a separate step on
-the <a href="/run">run</a> page, and it dry runs first. Cmd-S saves.</p>
-""", "review", with_js=True)
-
-
-@app.post("/review/{app_id}/save")
-def review_save(app_id: int, subject: str = Form(""), body: str = Form(""),
-                action: str = Form("")):
-    with db.tx() as c:
-        row = c.execute("SELECT draft_id FROM applications WHERE id=?",
-                        (app_id,)).fetchone()
-        if row:
-            c.execute("UPDATE drafts SET subject=?, body=?, edited=1 WHERE id=?",
-                      (subject.strip(), body.strip(), row["draft_id"]))
-        if action in ("approve", "reject"):
-            c.execute("UPDATE applications SET status=? WHERE id=?",
-                      ("approved" if action == "approve" else "rejected", app_id))
-    if action:
-        db.log("application", app_id, action)
-    return RedirectResponse("/review" if action else f"/review/{app_id}",
-                            status_code=303)
-
-
-@app.post("/review/approve_all")
-def approve_all():
-    with db.tx() as c:
-        ids = [r["id"] for r in c.execute(
-            "SELECT id FROM applications WHERE status='needs_review'")]
-        c.execute("UPDATE applications SET status='approved'"
-                  " WHERE status='needs_review'")
-    for i in ids:
-        db.log("application", i, "approved", bulk=True)
-    return RedirectResponse("/review?status=approved", status_code=303)
-
-
-# ------------------------------------------------------------------ settings
-
-@app.get("/settings", response_class=HTMLResponse)
-def settings():
-    cards = "".join(
-        f'<div class="card"><h4>{name}</h4><p>{desc}</p>'
-        f'<a class="btn" href="/settings/{key}">edit</a></div>'
-        for key, (name, _, desc) in editor.EDITABLE.items())
-    cfg = config()
-    return page(f"""
-<h2>Files you can edit here</h2>
-<p class="small dim">Nothing is written unless it parses, and every save keeps
-the previous version in data/backups.</p>
-<div class="grid">{cards}</div>
-
-<h2>Current safety settings</h2>
-<pre>dry_run                {cfg['safety'].get('dry_run')}
-never_auto_submit      {cfg['safety'].get('never_auto_submit')}
-require_verified       {cfg['safety'].get('require_verified_contact')}
-emails_per_day         {cfg['limits']['emails_per_day']}
-sent today             {sender.sent_today()}
-min_gap_seconds        {cfg['limits'].get('min_gap_seconds')}
-company_cooldown_days  {cfg['limits'].get('company_cooldown_days')}
-min_fit_to_draft       {cfg['scoring'].get('min_fit_to_draft')}
-resume mode            {cfg.get('resume', {}).get('mode')}</pre>
-""", "settings")
-
-
-@app.get("/settings/{key}", response_class=HTMLResponse)
-def settings_edit(key: str, saved: str = "", error: str = ""):
-    if key not in editor.EDITABLE:
-        return page('<div class="note bad">Not editable.</div>', "settings")
-    name, kind, desc = editor.EDITABLE[key]
-    text = editor.read(key)
-    msg = ""
-    if saved:
-        msg = f'<div class="note ok">{saved}</div>'
-    if error:
-        msg = f'<div class="note bad">Not saved. {error}</div>'
-    bks = "".join(
-        f'<form method="post" action="/settings/{key}/restore" class="inline">'
-        f'<input type="hidden" name="stamp" value="{b["stamp"]}">'
-        f'<button class="small">{b["stamp"]}</button></form> '
-        for b in editor.backups(key))
-    return page(f"""
-<h2>{name}</h2>
-<p class="small dim">{desc} Validated as {kind} before anything is written.</p>
-{msg}
-<form method="post" action="/settings/{key}" id="editform">
-  <textarea name="text" spellcheck="false">{text.replace("&","&amp;").replace("<","&lt;")}</textarea>
-  <div class="row">
-    <button type="submit" class="primary">save</button>
-    <a class="btn" href="/settings">back</a>
-    <div class="spacer"></div>
-    <span class="small dim">Cmd-S also saves</span>
-  </div>
-</form>
-{f'<h3>restore a previous version</h3><div class="row">{bks}</div>' if bks else ''}
-""", "settings", with_js=True)
-
-
-@app.post("/settings/{key}")
-def settings_save(key: str, text: str = Form("")):
-    if key not in editor.EDITABLE:
-        return RedirectResponse("/settings", status_code=303)
-    ok, msg = editor.save(key, text)
-    from urllib.parse import quote
-    q = f"saved={quote(msg)}" if ok else f"error={quote(msg)}"
-    return RedirectResponse(f"/settings/{key}?{q}", status_code=303)
-
-
-@app.post("/settings/{key}/restore")
-def settings_restore(key: str, stamp: str = Form("")):
-    ok, msg = editor.restore(key, stamp)
-    from urllib.parse import quote
-    q = f"saved={quote(msg)}" if ok else f"error={quote(msg)}"
-    return RedirectResponse(f"/settings/{key}?{q}", status_code=303)
-
-
-# ------------------------------------------------------------------ setup
-
-@app.get("/setup", response_class=HTMLResponse)
-def setup():
-    from core.config import path, profile, flat_profile
-    checks = []
-
-    def add(label, ok, hint="", fix=""):
-        checks.append((label, ok, hint, fix))
-
-    p = path("assets", "resume_default.pdf")
-    add("assets/resume_default.pdf", p.exists(),
-        "The resume that gets attached and uploaded. Upload your off-campus PDF.",
-        "/files")
-    OPT = {"gender", "portfolio"}
-    blanks = [k for k, v in flat_profile().items() if not v and k not in OPT]
-    add("profile fields complete", not blanks,
-        f"blank: {', '.join(blanks)}. Indian portals ask for these constantly."
-        if blanks else "", "/profile")
-    ev = profile().get("evidence") or []
-    fills = [e["id"] for e in ev if "FILL" in (e.get("line") or "")]
-    add(f"evidence lines written ({len(ev)-len(fills)}/{len(ev)})", not fills,
-        f"still placeholder: {', '.join(fills)}. These are the only claims the "
-        f"drafter may make about you." if fills else "", "/profile")
-    add("secrets/credentials.json", path("secrets", "credentials.json").exists(),
-        "Google OAuth client file. The form filler does not need it.", "/files")
-    add("gmail read token", path("secrets", "token.json").exists(),
-        "Connect it in one click.", "/gmail")
-    add("gmail send token", path("secrets", "token_send.json").exists(),
-        "Separate scope, separate consent.", "/gmail")
-    from core import llm, render
-    add(f"claude cli ({llm.CLI})", llm.available(),
-        "Optional. Without it the regex layer still parses most alerts.")
-    add(f"latex engine ({render.engine() or 'none'})", bool(render.engine()),
-        "Only needed for resume mode tailored. brew install tectonic")
-
-    def _row(label, ok, hint, fix):
-        badge = ('<span class="pill p-approved">ok</span>' if ok
-                 else '<span class="pill p-needs_review">todo</span>')
-        sub = f'<br><span class="small dim">{hint}</span>' if hint else ""
-        btn = f'<a class="btn" href="{fix}">fix</a>' if fix and not ok else ""
-        return (f'<tr><td>{badge}</td><td><b>{label}</b>{sub}</td>'
-                f'<td class="n">{btn}</td></tr>')
-
-    trs = "".join(_row(*c) for c in checks)
-    todo = sum(1 for _, ok, _, _ in checks if not ok)
-
-    return page(f"""
-<h2>Setup {"— all done" if not todo else f"— {todo} things left"}</h2>
-<table>{trs}</table>
-<div class="row"><button data-job onclick="run('doctor')" class="primary">
-run the full doctor</button></div>
-{LOG_PANEL}
-<h2>Google credentials, once</h2>
-<p class="small dim">Full steps, with the two places people get stuck, are on
-the <a href="/gmail">gmail page</a>. Short version:</p>
-<pre>1. console.cloud.google.com -> new project
-2. APIs and Services -> Library -> enable Gmail API
-3. Google Auth Platform -> Get started -> External
-4. Google Auth Platform -> Audience -> add yourself as a Test user
-5. Google Auth Platform -> Clients -> Create client -> Desktop app
-6. Download the JSON and upload it on the files page
-7. In Gmail, make a filter that labels job-alert senders  job-alerts</pre>
-<p class="small dim">Two separate tokens get stored. The collector holds
-gmail.readonly, the mailer holds gmail.send. A bug in one cannot do the other's
-job.</p>
-""", "setup", with_js=True)
-
-
-# ------------------------------------------------------------------ rest
-
-@app.get("/applications", response_class=HTMLResponse)
-def applications():
-    apps = rows(REVIEW_SQL + " WHERE a.status NOT IN ('needs_review')"
-                             " ORDER BY a.id DESC LIMIT 200")
-    trs = "".join(
-        f'<tr><td class="n">{a["id"]}</td>'
-        f'<td><b>{a["company_name"]}</b><br>'
-        f'<span class="small dim">{a["title"]}</span></td>'
-        f'<td><span class="pill p-{a["status"]}">{a["status"]}</span></td>'
-        f'<td class="small">{a["to_email"] or "-"}</td>'
-        f'<td class="n"><a class="btn" href="/review/{a["id"]}">open</a></td></tr>'
-        for a in apps)
-    return page('<h2>Applications</h2><table><tr><th>app</th><th>company</th>'
-                f'<th>status</th><th>to</th><th></th></tr>'
-                f'{trs or "<tr><td colspan=5 class=dim>Nothing yet.</td></tr>"}'
-                '</table>', "applications")
-
-
-@app.get("/stats", response_class=HTMLResponse)
-def stats():
-    from core import track
-    rep = track.report()
-    c = db.counts()
-    cards = "".join([
-        stat("jobs found", c.get("jobs", 0)),
-        stat("mails sent", rep["sent"]),
-        stat("form applications", rep["form_applications"]),
-        stat("replies", rep["replies"]),
-        stat("reply rate", f'{rep["reply_rate"]*100:.0f}%'),
-        stat("positive", rep.get("positive", 0)),
-        stat("rejections", rep.get("rejected", 0)),
-        stat("form maps cached", c.get("form_maps", 0)),
-    ])
-    ev = rows("SELECT entity, entity_id, kind, at FROM events ORDER BY id DESC LIMIT 50")
-    evs = "".join(f'<tr><td class="small dim n">{e["at"]}</td>'
-                  f'<td class="small">{e["entity"]} {e["entity_id"] or ""}</td>'
-                  f'<td class="small">{e["kind"]}</td></tr>' for e in ev)
-    return page(f'<div class="stats">{cards}</div>'
-                f'<h2>Recent activity</h2><table>{evs}</table>', "stats")
-
-
-# ------------------------------------------------------------------ files
-
-def _flash(saved: str, error: str) -> str:
-    if error:
-        return f'<div class="note bad">{error}</div>'
-    if saved:
-        return f'<div class="note ok">{saved}</div>'
-    return ""
-
-
-@app.get("/files", response_class=HTMLResponse)
-def files_page(saved: str = "", error: str = ""):
-    cards = []
-    for s in files.slot_state():
-        state = (f'<span class="pill p-approved">present</span> '
-                 f'<span class="small dim">{s["size"]//1024} KB &middot; {s["when"]}</span>'
-                 if s["exists"] else '<span class="pill p-needs_review">missing</span>')
-        retire_btn = ""
-        if s["exists"]:
-            retire_btn = (
-                f'<form method="post" action="/files/retire" class="inline">'
-                f'<input type="hidden" name="path" value="{s["path"]}">'
-                f'<button class="no small">remove</button></form>')
-        cards.append(f"""
-<div class="card">
-  <h4>{s["label"]} {state}</h4>
-  <p>{s["desc"]}<br><span class="mono small dim">{s["path"]}</span></p>
-  <form method="post" action="/files/upload" enctype="multipart/form-data">
-    <input type="hidden" name="key" value="{s["key"]}">
-    <input type="file" name="f" accept="{s["accept"]}" required
-           style="font-size:12px;max-width:100%">
-    <div class="row"><button class="primary small">
-      {"replace" if s["exists"] else "upload"}</button>{retire_btn}</div>
-  </form>
-</div>""")
-
-    customs = files.custom_resumes()
-    crows = "".join(
-        f'<tr><td class="n">{c["job_id"]}</td><td class="small mono">{c["path"]}</td>'
-        f'<td class="small dim n">{c["size"]//1024} KB &middot; {c["when"]}</td>'
-        f'<td class="n"><form method="post" action="/files/retire" class="inline">'
-        f'<input type="hidden" name="path" value="{c["path"]}">'
-        f'<button class="no small">remove</button></form></td></tr>'
-        for c in customs)
-
-    return page(_flash(saved, error) + f"""
-<h2>Files the system needs</h2>
-<p class="small dim">Checked by content, not by name. A PDF that is not really a
-PDF gets rejected here rather than halfway through a real application. Replaced
-files go to data/backups, nothing is deleted.</p>
-<div class="grid">{"".join(cards)}</div>
-
-<h2>Hand made resumes</h2>
-<p class="small dim">One per job id, and it beats every automatic choice for
-that job, permanently. Use this for the postings you tailored by hand.</p>
-<form method="post" action="/files/custom" enctype="multipart/form-data">
-  <div class="row">
-    <input type="text" name="job_id" placeholder="job id, eg 42"
-           style="max-width:150px" required>
-    <input type="file" name="f" accept=".pdf" required style="font-size:12px">
-    <button class="primary">upload for that job</button>
-  </div>
-</form>
-<table><tr><th>job</th><th>file</th><th></th><th></th></tr>
-{crows or '<tr><td colspan=4 class="dim">None yet.</td></tr>'}</table>
-""", "files")
-
-
-@app.post("/files/upload")
-async def files_upload(key: str = Form(...), f: UploadFile = File(...)):
-    from urllib.parse import quote
-    try:
-        msg = files.save_slot(key, await f.read())
-        return RedirectResponse(f"/files?saved={quote(msg)}", status_code=303)
-    except files.Rejected as e:
-        return RedirectResponse(f"/files?error={quote(str(e))}", status_code=303)
-
-
-@app.post("/files/custom")
-async def files_custom(job_id: str = Form(...), f: UploadFile = File(...)):
-    from urllib.parse import quote
-    try:
-        msg = files.save_custom(job_id, await f.read())
-        return RedirectResponse(f"/files?saved={quote(msg)}", status_code=303)
-    except files.Rejected as e:
-        return RedirectResponse(f"/files?error={quote(str(e))}", status_code=303)
-
-
-@app.post("/files/retire")
-def files_retire(path: str = Form(...)):
-    from urllib.parse import quote
-    try:
-        msg = files.retire(path)
-        return RedirectResponse(f"/files?saved={quote(msg)}", status_code=303)
-    except files.Rejected as e:
-        return RedirectResponse(f"/files?error={quote(str(e))}", status_code=303)
-
-
-# ------------------------------------------------------------------ gmail
-
-@app.get("/gmail", response_class=HTMLResponse)
-def gmail_page(request: Request, saved: str = "", error: str = ""):
-    has_creds = gmail_oauth.CREDS.exists()
-    cards = []
-    for s in gmail_oauth.status():
-        if s["connected"]:
-            body = ('<span class="pill p-approved">connected</span>'
-                    + ('' if s.get("has_refresh") else
-                       ' <span class="pill p-needs_review">no refresh token, '
-                       'reconnect</span>')
-                    + f'<p class="small dim" style="margin-top:8px">{s["why"]}</p>'
-                    f'<form method="post" action="/gmail/disconnect" class="inline">'
-                    f'<input type="hidden" name="which" value="{s["which"]}">'
-                    f'<button class="no small">disconnect</button></form>')
-        else:
-            btn = (f'<a class="btn primary" href="/gmail/start?which={s["which"]}">'
-                   f'connect</a>' if has_creds else
-                   '<span class="small dim">upload the client file first</span>')
-            body = (f'<span class="pill p-needs_review">not connected</span>'
-                    f'<p class="small dim" style="margin-top:8px">{s["why"]}</p>{btn}')
-        cards.append(f'<div class="card"><h4>{s["label"]}</h4>{body}</div>')
-
-    creds_note = ""
-    if not has_creds:
-        creds_note = ('<div class="note">No OAuth client file yet. '
-                      '<a href="/files">Upload it on the files page</a>, then come '
-                      'back. Both connections need it.</div>')
-
-    label_block = ""
-    names, err = gmail_oauth.labels()
-    if names:
-        want = config()["sources"]["gmail"].get("label", "job-alerts")
-        found = any(n.lower() == want.lower() for n in names)
-        if found:
-            label_block = (f'<div class="note ok">The label '
-                           f'<span class="mono">{want}</span> exists. The collector '
-                           f'reads only that label, never your inbox.</div>')
-        else:
-            label_block = (f'<div class="note">No label called '
-                           f'<span class="mono">{want}</span> yet. Make it in Gmail '
-                           f'along with a filter that applies it to your job alert '
-                           f'senders, or change the name in '
-                           f'<a href="/settings/config">config</a>.<br>'
-                           f'<span class="small dim">Your labels: '
-                           f'{", ".join(names[:25])}</span></div>')
-    elif err and err != "not connected yet":
-        label_block = f'<div class="note bad">Could not list labels: {err}</div>'
-
-    return page(_flash(saved, error) + creds_note + f"""
-<h2>Gmail</h2>
-<p class="small dim">Two separate connections on purpose. Read and send are
-different scopes stored in different files, so a bug in the collector cannot
-send anything and a bug in the mailer cannot read your mail.</p>
-<div class="grid">{"".join(cards)}</div>
-{label_block}
-<h2>Getting the client file</h2>
-<p class="small dim">The console moved this under <b>Google Auth Platform</b>.
-Older guides still say APIs and Services &gt; Credentials, which now redirects.</p>
-<pre>1. console.cloud.google.com  ->  create a project (any name)
-
-2. APIs and Services -> Library -> search "Gmail API" -> Enable
-   Nothing else works until this is on.
-
-3. Google Auth Platform -> Get started
-   App name: anything.  User support email: your own.
-   Audience: External.  Contact email: your own.
-
-4. Google Auth Platform -> Audience -> Test users -> Add users
-   Add your own gmail address.
-   Skipping this is why people get "access blocked" at the consent screen.
-
-5. Google Auth Platform -> Clients -> Create client
-   Application type: Desktop app.  Name: anything.  Create.
-
-6. Download JSON on the client you just made,
-   then upload it on the files page here.</pre>
-<div class="note">
-  <b>Step 5 has one wrong answer.</b> Pick <b>Desktop app</b>, not Web
-  application. A web client only accepts redirect URIs you registered in
-  advance, so it refuses the loopback redirect this dashboard uses, and the
-  error Google shows you does not explain that. The upload check on the files
-  page catches it if you pick wrong.
-</div>
-<div class="note">
-  <b>Publish it once it works.</b> While the app sits in <span class="mono">Testing</span>,
-  Google expires refresh tokens after seven days, so you would be reconnecting
-  every week. Google Auth Platform -&gt; Audience -&gt; <b>Publish app</b> fixes
-  that. You will see an "unverified app" warning at the consent screen, which is
-  expected: verification is for apps with outside users, and you are the only
-  user of this one. Click Advanced, then go to the app.
-</div>
-""", "gmail")
-
-
-@app.get("/gmail/start")
-def gmail_start(request: Request, which: str = "read"):
-    from urllib.parse import quote
-    redirect_uri = str(request.url_for("gmail_callback"))
-    try:
-        url = gmail_oauth.start(which, redirect_uri)
-    except gmail_oauth.OAuthError as e:
-        return RedirectResponse(f"/gmail?error={quote(str(e))}", status_code=303)
-    return RedirectResponse(url, status_code=303)
-
-
-@app.get("/gmail/callback", name="gmail_callback")
-def gmail_callback(request: Request, state: str = "", error: str = ""):
-    from urllib.parse import quote
-    if error:
-        return RedirectResponse(f"/gmail?error={quote('Google returned: ' + error)}",
-                                status_code=303)
-    try:
-        msg = gmail_oauth.finish(state, str(request.url))
-    except gmail_oauth.OAuthError as e:
-        return RedirectResponse(f"/gmail?error={quote(str(e))}", status_code=303)
-    return RedirectResponse(f"/gmail?saved={quote(msg)}", status_code=303)
-
-
-@app.post("/gmail/disconnect")
-def gmail_disconnect(which: str = Form(...)):
-    from urllib.parse import quote
-    return RedirectResponse(f"/gmail?saved={quote(gmail_oauth.disconnect(which))}",
-                            status_code=303)
-
-
-# ------------------------------------------------------------------ profile
-
-@app.get("/profile", response_class=HTMLResponse)
-def profile_page(saved: str = "", error: str = ""):
-    d = profileform.parsed()
-    blanks = set(profileform.blanks())
-    secs = []
-    for section, fields in profileform.FIELDS.items():
-        inputs = []
-        for key, label, ph, help_ in fields:
-            v = str((d.get(section) or {}).get(key) or "")
-            missing = f"{section}.{key}" in blanks
-            flag = ' style="border-color:var(--bad)"' if missing else ""
-            hint = f'<span class="small dim">{help_}</span>' if help_ else ""
-            inputs.append(
-                f'<label class="f">{label}'
-                f'{" <span class=pill p-rejected>needed</span>" if missing else ""}'
-                f'</label>'
-                f'<input type="text" name="{section}.{key}" value="{v.replace(chr(34), "&quot;")}"'
-                f' placeholder="{ph}"{flag}>{hint}')
-        secs.append(f'<h3>{section}</h3>{"".join(inputs)}')
-
-    evs = []
-    for e in profileform.evidence_items():
-        warn = (' <span class="pill p-rejected">placeholder</span>'
-                if e["placeholder"] else "")
-        evs.append(
-            f'<label class="f">{e["id"]}{warn} '
-            f'<span class="small dim">tags: {e["tags"]}</span></label>'
-            f'<textarea name="ev.{e["id"]}" style="min-height:70px">{e["line"]}</textarea>')
-
-    return page(_flash(saved, error) + f"""
-<h2>Your details</h2>
-<p class="small dim">These are what the form filler types and what the drafter
-cites. Saving edits profile.yaml in place, so the comments in that file survive.
-The raw file is still on <a href="/settings/profile">settings</a> if you prefer.</p>
-<form method="post" action="/profile" id="editform">
-  {"".join(secs)}
-  <h3>evidence</h3>
-  <p class="small dim">The only claims the drafter may make about you. It picks
-  the two whose tags best match a posting and builds the mail around them.
-  Anything still marked placeholder is skipped rather than sent, so a mail can
-  end up with nothing to say.</p>
-  {"".join(evs)}
-  <div class="row"><button class="primary" type="submit">save</button>
-  <span class="small dim">Cmd-S also saves</span></div>
-</form>
-""", "profile", with_js=True)
-
-
-@app.post("/profile")
-async def profile_save(request: Request):
-    from urllib.parse import quote
-    form = await request.form()
-    text = profileform.read()
-    changed = 0
-    try:
-        for k, v in form.items():
-            if k.startswith("ev."):
-                cur = {e["id"]: e["line"] for e in profileform.evidence_items()}
-                if cur.get(k[3:], None) != " ".join(str(v).split()):
-                    text = profileform.set_evidence(text, k[3:], str(v))
-                    changed += 1
-            elif "." in k:
-                section, key = k.split(".", 1)
-                if section in profileform.FIELDS:
-                    text = profileform.set_scalar(text, section, key, str(v))
-                    changed += 1
-    except KeyError as e:
-        return RedirectResponse(f"/profile?error={quote(str(e))}", status_code=303)
-
-    ok, msg = profileform.save(text)
-    q = f"saved={quote(msg)}" if ok else f"error={quote(msg)}"
-    return RedirectResponse(f"/profile?{q}", status_code=303)

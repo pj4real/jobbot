@@ -147,3 +147,39 @@ CREATE TABLE IF NOT EXISTS send_log (
   at           TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS ix_send_day ON send_log(day);
+
+-- ---------------------------------------------------------------- v2 --------
+
+-- Sender memory. Scanning a whole inbox only stays cheap because a sender you
+-- have already judged never costs anything again. One "not a job" on a
+-- newsletter suppresses every future mail from it, for free, forever.
+CREATE TABLE IF NOT EXISTS senders (
+  id           INTEGER PRIMARY KEY,
+  address      TEXT NOT NULL UNIQUE,      -- lowercased, envelope address only
+  domain       TEXT,
+  verdict      TEXT NOT NULL,             -- job | not_job | unsure
+  reason       TEXT,                      -- who decided and why
+  seen         INTEGER NOT NULL DEFAULT 1,
+  jobs_found   INTEGER NOT NULL DEFAULT 0,
+  decided_at   TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS ix_senders_verdict ON senders(verdict);
+
+-- What happened to an application, in order. The applications table holds the
+-- current state; this holds how it got there, which is what you actually want
+-- to look at three weeks later.
+CREATE TABLE IF NOT EXISTS timeline (
+  id             INTEGER PRIMARY KEY,
+  application_id INTEGER REFERENCES applications(id),
+  job_id         INTEGER REFERENCES jobs(id),
+  kind           TEXT NOT NULL,           -- found | applied | mailed | replied | ...
+  detail         TEXT,
+  at             TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS ix_timeline_job ON timeline(job_id, at);
+
+-- Your own triage on a found job, before any application exists.
+ALTER TABLE jobs ADD COLUMN triage TEXT;          -- NULL | shortlisted | skipped
+ALTER TABLE jobs ADD COLUMN triage_at TEXT;
+ALTER TABLE jobs ADD COLUMN sender_id INTEGER REFERENCES senders(id);
+ALTER TABLE senders ADD COLUMN decided_by TEXT NOT NULL DEFAULT 'system';

@@ -94,20 +94,28 @@ def check(app: dict) -> None:
         raise Blocked("contact address is not verified, and guessing bounces")
     if not app.get("to_email"):
         raise Blocked("no recipient address")
-    if company_on_cooldown(app["company_id"]):
+    # the cooldown exists to stop you cold mailing the same company twice. A
+    # follow up on a thread you already started is the opposite of that.
+    if app.get("channel") != "followup" and company_on_cooldown(app["company_id"]):
         raise Blocked(f"already contacted this company inside "
                       f"{cfg['limits'].get('company_cooldown_days',45)} days")
 
 
 # ------------------------------------------------------------------ send
 
-def compose(to: str, subject: str, body: str, attachment: str | None) -> EmailMessage:
+def compose(to: str, subject: str, body: str, attachment: str | None,
+            in_reply_to: str | None = None) -> EmailMessage:
     ident = profile()["identity"]
     m = EmailMessage()
     m["To"] = to
     m["From"] = f"{ident['full_name']} <{ident['email']}>"
     m["Subject"] = subject
     m["Reply-To"] = ident["email"]
+    if in_reply_to:
+        # without these a follow up arrives as a second cold mail rather than a
+        # reply, which reads worse than not following up at all
+        m["In-Reply-To"] = in_reply_to
+        m["References"] = in_reply_to
     m.set_content(body)                    # plain text only. no html part.
     if attachment:
         p = Path(attachment)
@@ -122,7 +130,8 @@ def send_one(app: dict, dry_run: bool | None = None) -> dict:
     dry = cfg["safety"].get("dry_run", True) if dry_run is None else dry_run
     check(app)
 
-    msg = compose(app["to_email"], app["subject"], app["body"], app.get("resume_path"))
+    msg = compose(app["to_email"], app["subject"], app["body"],
+                  app.get("resume_path"), app.get("in_reply_to"))
 
     if dry:
         return {"dry_run": True, "to": app["to_email"], "subject": app["subject"],
@@ -130,7 +139,10 @@ def send_one(app: dict, dry_run: bool | None = None) -> dict:
                 "attachment": Path(app["resume_path"]).name if app.get("resume_path") else None}
 
     raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
-    res = service().users().messages().send(userId="me", body={"raw": raw}).execute()
+    payload = {"raw": raw}
+    if app.get("thread_id"):
+        payload["threadId"] = app["thread_id"]      # keeps it in the same thread
+    res = service().users().messages().send(userId="me", body=payload).execute()
 
     with db.tx() as c:
         c.execute("INSERT INTO send_log (day, to_email, application_id)"

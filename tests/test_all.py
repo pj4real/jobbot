@@ -185,6 +185,69 @@ with db.tx() as c:
 check("cap clears when the log clears", not blocked(base, ""))
 
 
+# ------------------------------------------------------------------ followups
+section("follow ups")
+
+from core import track                                          # noqa: E402
+
+with db.tx() as _c:
+    _c.execute("INSERT INTO companies (name,norm_name) VALUES ('Acme','acme')")
+    _cid = _c.execute("SELECT id FROM companies WHERE norm_name='acme'").fetchone()["id"]
+    _c.execute("INSERT INTO jobs (company_id,title,role_family,dedupe_hash,fit_score)"
+               " VALUES (?,'SDE Intern','sde','fu_hash',0.9)", (_cid,))
+    _jid = _c.execute("SELECT id FROM jobs WHERE dedupe_hash='fu_hash'").fetchone()["id"]
+    _c.execute("INSERT INTO contacts (company_id,name,email,source,verified)"
+               " VALUES (?,'Dev','hire@acme.com','posting',1)", (_cid,))
+    _ct = _c.execute("SELECT id FROM contacts WHERE email='hire@acme.com'").fetchone()["id"]
+    _c.execute("INSERT INTO drafts (job_id,contact_id,subject,body) VALUES (?,?,'s','b')",
+               (_jid, _ct))
+    _d = _c.execute("SELECT id FROM drafts ORDER BY id DESC LIMIT 1").fetchone()["id"]
+    _c.execute("INSERT INTO applications (job_id,draft_id,channel,status,thread_id,"
+               "submitted_at) VALUES (?,?,'email','submitted','thr_1',"
+               "datetime('now','-9 days'))", (_jid, _d))
+
+due = track.due_followups()
+check("a mail sent 9 days ago is due a follow up", len(due) == 1, str(len(due)))
+fu = track.build_followup(due[0]) if due else {}
+check("the follow up subject threads with Re:",
+      fu.get("subject", "").startswith("Re:"), fu.get("subject", ""))
+check("it greets by name", "Dev" in fu.get("body", ""), fu.get("body", "")[:30])
+check("and names the role", "SDE Intern" in fu.get("body", ""))
+
+with db.tx() as _c:
+    _c.execute("INSERT INTO events (entity,entity_id,kind) VALUES ('application',?,"
+               "'followup')", (due[0]["id"],))
+check("once queued it is never due again", not track.due_followups())
+
+with db.tx() as _c:
+    _c.execute("UPDATE applications SET submitted_at=datetime('now','-2 days')"
+               " WHERE thread_id='thr_1'")
+    _c.execute("DELETE FROM events WHERE kind='followup'")
+check("a mail sent 2 days ago is not due yet", not track.due_followups())
+
+_fu_app = {"id": 1, "status": "approved", "company_id": _cid, "to_email": "hire@acme.com",
+           "verified": 1, "channel": "followup", "thread_id": "thr_1"}
+with db.tx() as _c:
+    _aid = _c.execute("SELECT id FROM applications WHERE thread_id='thr_1'").fetchone()["id"]
+    _c.execute("INSERT INTO send_log (day,to_email,application_id)"
+               " VALUES (date('now','localtime'),'hire@acme.com',?)", (_aid,))
+_fu_app["id"] = _aid
+check("a follow up is not blocked by the company cooldown",
+      not blocked(_fu_app, ""))
+check("but a fresh cold mail to that company still is",
+      blocked({**_fu_app, "channel": "email"}, ""))
+check("cooldown is attributed through the application, not the address",
+      send.company_on_cooldown(_cid) == 1, send.company_on_cooldown(_cid))
+with db.tx() as _c:
+    _c.execute("DELETE FROM send_log")
+
+_m = send.compose("a@b.com", "Re: x", "body", None, in_reply_to="<msg-1@mail>")
+check("a follow up carries In-Reply-To and References",
+      _m["In-Reply-To"] == "<msg-1@mail>" and _m["References"] == "<msg-1@mail>")
+_m2 = send.compose("a@b.com", "x", "body", None)
+check("a first contact carries neither", not _m2["In-Reply-To"])
+
+
 # ------------------------------------------------------------------ drafting
 section("drafting")
 
@@ -392,6 +455,9 @@ def flagged(text):
 
 
 LEAKS = [
+    ('SEARXNG_SECRET=8f3a91c04be27d5619ab', "a generated env secret"),
+    ('N8N_RUNNERS_AUTH_TOKEN=abc123def456ghi789', "an env auth token"),
+    ('SANDBOX_API_KEY=pk_live_9f8e7d6c5b4a', "an env api key"),
     ('{"installed":{"client_secret":"GOCSPX-abc123def456"}}', "client secret"),
     ('{"refresh_token":"1//0gABCdefGHIjklMNOpqrSTUvwxYZ01234"}', "refresh token"),
     ('ya29.a0AfH6SMBxxxxxxxxxxxxxxxxxxxxxxxxxx', "access token"),
@@ -412,11 +478,16 @@ CLEAN = [
     ('order id 1234512345', "a long number"),
     ('+91 00000 00000', "an obvious placeholder"),
     ('graduating 2027', "a year"),
+    ('N8N_VERSION=1.115.2', "a version pin"),
+    ('MODE=regular', "an ordinary setting"),
+    ('# SECRET_KEY= not set', "a commented out blank"),
 ]
 false = [d for s, d in CLEAN if flagged(s)]
 check("and does not flag ordinary code and text", not false, str(false))
 
-for name in ("profile.yaml", "resume.yaml", "secrets/", "data/"):
+check(".env files are refused outright",
+      any(f == ".env" for f, _ in pf.FORBIDDEN))
+for name in ("profile.yaml", "resume.yaml", "secrets/", "data/", ".env"):
     check(f"{name} is gitignored",
           name.rstrip("/") in (ROOT / ".gitignore").read_text())
 check("pdfs are gitignored", "*.pdf" in (ROOT / ".gitignore").read_text())

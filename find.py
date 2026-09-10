@@ -34,10 +34,19 @@ def cmd_collect(a):
     total = 0
     if cfg()["sources"]["gmail"].get("enabled"):
         from collectors import gmail
-        print("gmail...")
+        mode = "whole mailbox" if cfg()["sources"]["gmail"].get("scan_all", True) \
+            else "label only"
+        print(f"gmail ({mode})...")
         s = gmail.collect()
-        print(f"  seen {s['seen']}, new {s['new']}, duplicate {s['duplicate']}")
-        total += s["new"]
+        print(f"  matched {s.get('seen', 0)}  ->  kept {s.get('new', 0)}, "
+              f"already had {s.get('duplicate', 0)}")
+        if s.get("not_job") or s.get("muted"):
+            print(f"  filtered out {s.get('not_job', 0)} not-a-job"
+                  + (f", {s['muted']} from muted senders" if s.get("muted") else ""))
+        if s.get("llm_calls"):
+            print(f"  asked the model about {s.get('unsure', 0)} unclear ones "
+                  f"in {s['llm_calls']} call(s)")
+        total += s.get("new", 0)
     wa = cfg()["sources"].get("whatsapp", {})
     if wa.get("enabled"):
         from collectors import whatsapp

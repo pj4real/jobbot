@@ -1,4 +1,8 @@
 # ---- your details. never commit these. ----
+.env
+*.env
+!*.example.env
+
 profile.yaml
 resume.yaml
 secrets/

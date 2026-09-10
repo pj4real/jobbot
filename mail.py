@@ -2,6 +2,7 @@
 """The mailer. Drafts outreach, waits for you, then sends within caps.
 
     python mail.py draft              draft for every eligible job
+    python mail.py followup           queue the follow ups that are due
     python mail.py queue              what is waiting for review
     python mail.py show <app_id>      read one draft in full
     python mail.py edit <app_id>      open it in $EDITOR
@@ -34,7 +35,8 @@ def _rows(sql, args=()):
 
 
 APP_SQL = """
-SELECT a.id, a.status, a.job_id, a.resume_id, a.created_at,
+SELECT a.id, a.status, a.job_id, a.resume_id, a.created_at, a.thread_id,
+       a.channel,
        d.subject, d.body, d.evidence_ids,
        j.title, j.company_id, j.fit_score, j.apply_url,
        co.name AS company_name,
@@ -99,6 +101,47 @@ def cmd_draft(a):
         made += 1
 
     print(f"\n  {made} drafts waiting. Read them: python mail.py queue")
+    return 0
+
+
+def cmd_followup(a):
+    """Queue the follow ups that are due. They go through the same gate as
+    everything else: drafted, reviewed by you, then sent within the same cap."""
+    from core import track
+    due = track.due_followups()
+    if not due:
+        print("  nothing due. A follow up is queued once, "
+              f"{config()['limits'].get('followup_after_days', 7)} days after "
+              "sending, and only if nobody replied.")
+        return 0
+
+    made = 0
+    for app in due:
+        if not app.get("to_email"):
+            print(f"  skipping {app['company_name']}: no address on record")
+            continue
+        fu = track.build_followup(app)
+        with db.tx() as c:
+            did = c.execute(
+                "INSERT INTO drafts (job_id, contact_id, subject, body, evidence_ids)"
+                " SELECT ?, d.contact_id, ?, ?, '[]' FROM drafts d"
+                " JOIN applications a ON a.draft_id = d.id WHERE a.id = ?",
+                (app["job_id"], fu["subject"], fu["body"], app["id"])).lastrowid
+            # a follow up is its own application row on a separate channel, so
+            # the unique (job_id, channel) constraint does not fight it
+            c.execute(
+                "INSERT OR IGNORE INTO applications"
+                " (job_id, draft_id, resume_id, channel, status, thread_id)"
+                " SELECT ?, ?, a.resume_id, 'followup', 'needs_review', a.thread_id"
+                "   FROM applications a WHERE a.id = ?",
+                (app["job_id"], did, app["id"]))
+        db.log("application", app["id"], "followup", queued_draft=did)
+        print(f"  queued follow up to {app['company_name']} "
+              f"(sent {app['submitted_at'][:10]})")
+        made += 1
+
+    if made:
+        print(f"\n  {made} waiting for you: python mail.py queue")
     return 0
 
 
@@ -205,6 +248,8 @@ def cmd_send(a):
 
     done = blocked = 0
     for i, r in enumerate(rows):
+        if r.get("channel") == "followup":
+            r = {**r, "resume_path": None}    # they already have it
         try:
             out = sender.send_one(r, dry_run=dry)
         except sender.Blocked as e:
@@ -248,9 +293,9 @@ def cmd_status(a):
     return 0
 
 
-COMMANDS = {"draft": cmd_draft, "queue": cmd_queue, "show": cmd_show, "edit": cmd_edit,
-            "approve": cmd_approve, "reject": cmd_reject, "send": cmd_send,
-            "status": cmd_status}
+COMMANDS = {"draft": cmd_draft, "followup": cmd_followup, "queue": cmd_queue,
+            "show": cmd_show, "edit": cmd_edit, "approve": cmd_approve,
+            "reject": cmd_reject, "send": cmd_send, "status": cmd_status}
 
 
 def main():

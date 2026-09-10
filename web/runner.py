@@ -29,6 +29,7 @@ JOBS: dict[str, tuple[list[str], str, bool]] = {
     "rescore":   (["find.py", "rescore"],          "Rescore everything", False),
     "draft":     (["mail.py", "draft"],            "Write outreach drafts", False),
     "draft_tpl": (["mail.py", "draft", "--no-llm"], "Draft from template only", False),
+    "followup":  (["mail.py", "followup"],         "Queue follow ups that are due", False),
     "send_dry":  (["mail.py", "send"],             "Dry run the approved queue", False),
     "send_live": (["mail.py", "send", "--live"],   "SEND the approved queue", True),
     "track":     (["run.py", "track"],             "Check for replies", False),

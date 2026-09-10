@@ -74,7 +74,7 @@ FOLLOWUP = """Hi{name},
 
 Following up on my application for the {title} role, sent on {date}.
 
-Still very interested. Happy to send anything else that would help.
+Still interested, and happy to send anything else that would help.
 
 Thanks,
 {me}"""

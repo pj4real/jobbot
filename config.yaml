@@ -28,8 +28,12 @@ scoring:
 sources:
   gmail:
     enabled: true
-    label: job-alerts         # collector reads this label, never your inbox
+    scan_all: true            # scan the whole mailbox, not just one label.
+                              # Gmail does the first cut on its own servers, so
+                              # only likely postings are ever downloaded.
+    label: job-alerts         # used only when scan_all is false
     lookback_days: 30
+    max_messages: 800         # ceiling per run, so a first scan cannot run away
   whatsapp:
     enabled: false            # turn on at step 06
     waha_url: http://localhost:3000

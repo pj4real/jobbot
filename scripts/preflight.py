@@ -26,6 +26,7 @@ FORBIDDEN = [
     ("resume.yaml", "your whole resume bank"),
     ("data/", "your job database, drafts and screenshots"),
     (".pdf", "a resume"),
+    (".env", "generated secrets. env files are never committed"),
 ]
 
 # content that should never appear in a tracked file
@@ -44,6 +45,10 @@ PATTERNS = [
     (re.compile(r"ya29\.[\w.-]{20,}"), "a Google access token"),
     (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"), "a private key"),
     (re.compile(r"\bAKIA[0-9A-Z]{16}\b"), "an AWS key"),
+    # a generated secret in an env file looks like none of the branded shapes
+    # above. Catch the shape instead: a secret-ish name with a real value.
+    (re.compile(r"^[A-Z][A-Z0-9_]*(SECRET|TOKEN|API_?KEY|PASSWORD|PASSWD)"
+                r"[A-Z0-9_]*\s*=\s*\S{8,}", re.M), "a secret in an env file"),
     (re.compile(r"\bsk-[A-Za-z0-9]{20,}\b"), "an API key"),
 ]
 

@@ -55,9 +55,21 @@ def tx():
 
 
 def init() -> None:
+    """Idempotent. CREATE TABLE IF NOT EXISTS handles itself, but ALTER TABLE
+    ADD COLUMN does not, so those run one at a time and a duplicate is fine."""
     sql = (Path(__file__).parent / "schema.sql").read_text()
+    head, _, alters = sql.partition("-- v2 --")
     with tx() as c:
-        c.executescript(sql)
+        c.executescript(head)
+    for stmt in [s.strip() for s in alters.split(";") if s.strip()]:
+        if not stmt.upper().startswith(("ALTER", "CREATE")):
+            continue
+        try:
+            with tx() as c:
+                c.execute(stmt)
+        except sqlite3.OperationalError as e:
+            if "duplicate column" not in str(e).lower():
+                raise
 
 
 def log(entity: str, entity_id, kind: str, **payload) -> None:
