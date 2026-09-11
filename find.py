@@ -160,7 +160,13 @@ def cmd_resolve(a):
     print(f"\n  looked at {s['looked_at']}")
     print(f"  {s['external']} now point at a real form and can be filled")
     print(f"  {s['easy_apply']} are Easy Apply, yours to click through")
-    print(f"  {s['unknown']} could not be worked out, {s['failed']} failed to load")
+    if s.get("offsite"):
+        print(f"  {s['offsite']} apply on the company site, open them to see where")
+    if s["unknown"]:
+        print(f"  {s['unknown']} could not be worked out. The pages are saved in")
+        print(f"    data/linkedin/ so the parser can be fixed from what was there.")
+    if s["failed"]:
+        print(f"  {s['failed']} failed to load")
     if s["described"]:
         print(f"  {s['described']} got their full description, and were rescored")
     if s["external"]:

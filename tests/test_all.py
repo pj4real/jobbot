@@ -155,11 +155,19 @@ check("a digest link is refused as having nothing to fill",
 section("linkedin resolver")
 
 FIX = ROOT / "tests" / "fixtures"
-try:
+def _browser_ready() -> bool:
+    try:
+        from playwright.sync_api import sync_playwright
+        from pathlib import Path as _P
+        with sync_playwright() as _p:
+            return _P(_p.chromium.executable_path).exists()
+    except Exception:
+        return False
+
+
+_HAVE_PW = _browser_ready()
+if _HAVE_PW:
     from playwright.sync_api import sync_playwright as _spw
-    _HAVE_PW = True
-except ImportError:
-    _HAVE_PW = False
 
 if _HAVE_PW and (FIX / "linkedin_external.html").exists():
     from collectors import linkedin as li                       # noqa: E402
@@ -193,6 +201,8 @@ if _HAVE_PW and (FIX / "linkedin_external.html").exists():
         _b.close()
 else:
     check("linkedin fixtures present", (FIX / "linkedin_external.html").exists())
+    print("  --   page parsing skipped: chromium is not installed")
+    print("       run `playwright install chromium` to cover those too")
 
 _li_src = (ROOT / "collectors" / "linkedin.py").read_text()
 check("the resolver never clicks apply",
@@ -256,6 +266,32 @@ check("select option matching, yes-ish",
                           "Yes, anywhere in India") == "y")
 
 
+# ------------------------------------------------------------------ contacts
+section("who it writes to")
+
+from core.extract import usable_contact                         # noqa: E402
+from core.config import profile as _prof                        # noqa: E402
+
+# a fresh clone has a blank profile, so give the check a known address to
+# work against rather than depending on whoever is running it
+_mine = (_prof()["identity"].get("email") or "").strip()
+if not _mine:
+    _mine = "someone@gmail.com"
+    _prof()["identity"]["email"] = _mine       # the loader caches, so this sticks
+check("your own address is never an employer contact",
+      not usable_contact(_mine), _mine)
+check("even in different case", not usable_contact(_mine.upper()))
+for junk in ("no-reply@linkedin.com", "notifications@naukri.com",
+             "jobs-noreply@indeed.com", "postmaster@x.com",
+             "alerts@instahyre.com"):
+    check(f"{junk.split('@')[0]} is refused", not usable_contact(junk))
+for good in ("careers@zeta.tech", "hiring@acme.io", "ananya.rao@company.com",
+             "tpo@vit.ac.in"):
+    check(f"{good} is usable", usable_contact(good))
+check("an empty address is refused", not usable_contact(""))
+check("something without an @ is refused", not usable_contact("careers"))
+
+
 # ------------------------------------------------------------------ the gate
 section("send gate")
 
@@ -276,6 +312,9 @@ check("draft status is blocked", blocked({**base, "status": "draft"}, ""))
 check("unverified contact is blocked", blocked({**base, "verified": 0}, ""))
 check("missing address is blocked", blocked({**base, "to_email": ""}, ""))
 check("a clean approved row passes", not blocked(base, ""))
+check("writing to yourself is blocked at the gate too",
+      blocked({**base, "to_email": _mine}, ""),
+      f"expected {_mine} to be refused as a recipient")
 
 # fill the day's cap and confirm it stops
 cap = int(__import__("core.config", fromlist=["config"]).config()["limits"]["emails_per_day"])

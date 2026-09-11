@@ -94,6 +94,10 @@ def check(app: dict) -> None:
         raise Blocked("contact address is not verified, and guessing bounces")
     if not app.get("to_email"):
         raise Blocked("no recipient address")
+    mine = (profile()["identity"].get("email") or "").lower()
+    if mine and app["to_email"].strip().lower() == mine:
+        raise Blocked("that is your own address. Something upstream mistook the "
+                      "recipient of a job alert for the employer's contact.")
     # the cooldown exists to stop you cold mailing the same company twice. A
     # follow up on a thread you already started is the opposite of that.
     if app.get("channel") != "followup" and company_on_cooldown(app["company_id"]):

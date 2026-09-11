@@ -59,8 +59,8 @@ def template_body(job: dict, contact_name: str = "") -> str:
         for e in ev:
             lines += ["", " ".join(e["line"].split())]
     else:
-        lines += ["", "[no usable evidence lines in profile.yaml. Fill the FILL "
-                      "entries under `evidence:` before sending this.]"]
+        lines += ["", "[This mail has nothing to say about you yet. Write the "
+                      "evidence lines on the Setup page before sending it.]"]
     lines += [
         "",
         "My resume is attached. Happy to talk whenever suits you.",

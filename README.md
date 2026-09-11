@@ -18,15 +18,21 @@ it, and the system works without it on regex alone.
 
 ## Setup
 
-    git clone <this repo> && cd jobbot
-    python3 -m venv .venv && source .venv/bin/activate
-    pip install -r requirements.txt
-    playwright install chromium
-    python run.py init
+    git clone https://github.com/pj4real/jobbot.git && cd jobbot
+    ./scripts/install.sh
+    source .venv/bin/activate
     python run.py web
 
 Then open http://127.0.0.1:8000 and work down the **setup** page. It lists what
 is missing with a fix link on each row.
+
+`install.sh` is safe to rerun and does everything a script can: python check,
+venv, dependencies, Chromium, database, git hook, test suite. It stops at the
+three things that need a person.
+
+**[INSTALL.md](INSTALL.md) has the detailed version**, including the Google
+OAuth steps, a troubleshooting table, and a section written for an AI agent
+doing the install on someone's behalf.
 
 `init` copies `profile.example.yaml` to `profile.yaml` for you. That file is
 gitignored, along with `resume.yaml`, `secrets/`, `data/` and every PDF, so

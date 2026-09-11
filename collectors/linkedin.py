@@ -97,18 +97,33 @@ def _apply_target(page) -> tuple[str, str]:
         except Exception:
             continue
 
-    # LinkedIn sometimes only reveals the destination after a click, which we
-    # will not do. The page often still carries it in a data attribute.
+    # The visible button often carries no href at all: LinkedIn fetches the
+    # destination on click, which we will not do. But the page ships the answer
+    # as typed JSON in <code> blocks, and two type markers settle it.
     try:
         html = page.content()
-        m = re.search(r'"companyApplyUrl"\s*:\s*"([^"]+)"', html)
-        if m:
-            return "external", m.group(1).replace("\\u0026", "&").replace("\\/", "/")
-        if "easyApplyUrl" in html or "jobs-apply-button--top-card" in html:
-            return "easy_apply", ""
     except Exception:
-        pass
+        return "unknown", ""
+
+    for pat in (r'"companyApplyUrl"\s*:\s*"([^"]+)"',
+                r'"applyUrl"\s*:\s*"([^"]+)"',
+                r'"companyApplyUrl\\?"\s*:\s*\\?"([^"\\]+)'):
+        m = re.search(pat, html)
+        if m:
+            return "external", _unescape(m.group(1))
+
+    if re.search(r"OffsiteApply", html):
+        # offsite, but the url did not survive. Still better than unknown: the
+        # posting page will hand it over when you click Apply yourself.
+        return "offsite", ""
+    if re.search(r"ComplexOnsiteApply|SimpleOnsiteApply|easyApplyUrl", html):
+        return "easy_apply", ""
     return "unknown", ""
+
+
+def _unescape(u: str) -> str:
+    return (u.replace("\\u0026", "&").replace("\\/", "/")
+             .replace("&amp;", "&").replace("\\", ""))
 
 
 def _signed_in(page) -> bool:
@@ -135,6 +150,31 @@ def pending(limit: int) -> list[dict]:
             " ORDER BY j.fit_score DESC, j.id DESC LIMIT ?", (limit,))]
 
 
+def _retitle_company(job_id: int, name: str) -> None:
+    """The page knows the real employer; the alert email often did not."""
+    from core.extract import norm_company, upsert_company
+    clean = re.sub(r"\s+", " ", name.splitlines()[0]).strip(" ·-|")[:80]
+    if not clean or len(clean) < 2:
+        return
+    with db.tx() as c:
+        cid = upsert_company(c, clean)
+        c.execute("UPDATE jobs SET company_id=? WHERE id=?", (cid, job_id))
+
+
+EVIDENCE_DIR = path("data", "linkedin")
+
+
+def _keep_evidence(page, job_id: int) -> None:
+    """A posting whose apply route we could not read is a bug report. Keep the
+    page so it can be fixed from what was actually there."""
+    try:
+        EVIDENCE_DIR.mkdir(parents=True, exist_ok=True)
+        (EVIDENCE_DIR / f"{job_id}.html").write_text(page.content(), encoding="utf-8")
+        page.screenshot(path=str(EVIDENCE_DIR / f"{job_id}.png"), full_page=False)
+    except Exception:
+        pass
+
+
 def resolve(limit: int | None = None, headless: bool = False,
             verbose: bool = True) -> dict:
     cfg = config().get("sources", {}).get("linkedin", {}) or {}
@@ -142,8 +182,8 @@ def resolve(limit: int | None = None, headless: bool = False,
     gap = float(cfg.get("gap_seconds", 6))
 
     jobs = pending(cap)
-    stats = {"looked_at": 0, "external": 0, "easy_apply": 0, "unknown": 0,
-             "described": 0, "failed": 0, "signed_out": False}
+    stats = {"looked_at": 0, "external": 0, "easy_apply": 0, "offsite": 0,
+             "unknown": 0, "described": 0, "failed": 0, "signed_out": False}
     if not jobs:
         return stats
 
@@ -196,6 +236,9 @@ def resolve(limit: int | None = None, headless: bool = False,
                 fields.append("title=?")
                 args.append(title.splitlines()[0][:120])
 
+            if company and len(company) > 1:
+                _retitle_company(job["id"], company)
+
             if kind == "external" and target:
                 clean, tkind, platform = canonical(target)
                 if tkind == "form":
@@ -207,6 +250,13 @@ def resolve(limit: int | None = None, headless: bool = False,
                               f" -> {platform} form")
                 else:
                     stats["unknown"] += 1
+            elif kind == "offsite":
+                fields.append("apply_kind=?")
+                args.append("linkedin_offsite")
+                stats["offsite"] = stats.get("offsite", 0) + 1
+                if verbose:
+                    print(f"  {job['id']:>4}  {(company or job['company'] or '?')[:22]:<24}"
+                          f" -> applies on the company site, open it to see where")
             elif kind == "easy_apply":
                 fields.append("apply_kind=?")
                 args.append("linkedin_easy")
@@ -216,6 +266,7 @@ def resolve(limit: int | None = None, headless: bool = False,
                           f" -> easy apply, yours to click")
             else:
                 stats["unknown"] += 1
+                _keep_evidence(page, job["id"])
 
             fields.append("resolved_at=datetime('now')")
             args.append(job["id"])

@@ -150,6 +150,34 @@ def clean_title(t: str) -> str:
     return re.sub(r"\s{2,}", " ", t)
 
 
+JUNK_ADDRESS = re.compile(
+    r"noreply|no-reply|donotreply|do-not-reply|notifications?@|bounce|"
+    r"mailer|postmaster|unsubscribe|@(linkedin|indeed|naukri|glassdoor|"
+    r"foundit|shine|monster|instahyre|unstop|internshala)\.", re.I)
+
+
+def usable_contact(addr: str) -> bool:
+    """Is this an address worth writing to?
+
+    Every alert mail contains your own address, because you are the recipient.
+    Taking it as the employer's contact meant six companies in a row got a
+    draft addressed to the reader. That is the bug this exists to stop.
+    """
+    if not addr or "@" not in addr:
+        return False
+    a = addr.strip().lower().strip(".,;:<>()[]")
+    from .config import profile
+    try:
+        mine = (profile()["identity"].get("email") or "").lower()
+    except Exception:
+        mine = ""
+    if mine and a == mine:
+        return False
+    if JUNK_ADDRESS.search(a):
+        return False
+    return True
+
+
 def role_family(title: str, body: str) -> str:
     for rx, fam in ROLE_FAMILY:
         if rx.search(title) or rx.search(body[:1200]):
@@ -182,9 +210,7 @@ def parse_regex(item: dict) -> dict | None:
     url, kind = pick_apply_url(text)
     loc = LOCATION_RE.search(text)
     dl = DEADLINE_RE.search(text)
-    emails = [e for e in EMAIL_RE.findall(text)
-              if not re.search(r"noreply|no-reply|donotreply|notifications?@|"
-                               r"support@|info@mail|bounce", e, re.I)]
+    emails = [e for e in EMAIL_RE.findall(text) if usable_contact(e)]
 
     return {
         "title": title[:120],
@@ -290,7 +316,7 @@ def save(parsed: dict, raw_id: int) -> int | None:
         if cur.rowcount == 0:
             return None
         job_id = cur.lastrowid
-        if parsed.get("apply_email"):
+        if parsed.get("apply_email") and usable_contact(parsed["apply_email"]):
             c.execute("INSERT OR IGNORE INTO contacts (company_id, email, source, verified)"
                       " VALUES (?,?,?,1)", (cid, parsed["apply_email"], "posting"))
         return job_id
