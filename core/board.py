@@ -101,7 +101,14 @@ def next_action(row: dict, stage: str) -> dict:
             return {"kind": "send", "label": "Approved, ready to send",
                     "hint": "goes out on the next send run"}
         if row.get("apply_url"):
-            return {"kind": "fill", "label": "Fill the form",
+            from .urls import fillable
+            can_fill, _ = fillable(row["apply_url"])
+            if can_fill:
+                return {"kind": "fill", "label": "Fill the form",
+                        "hint": row.get("apply_kind") or ""}
+            # a posting page is something you read and click Apply on. Offering
+            # "fill" here launched a browser at a LinkedIn digest.
+            return {"kind": "open", "label": "Open the posting",
                     "hint": row.get("apply_kind") or ""}
         if row.get("apply_email"):
             return {"kind": "draft", "label": "Write the mail",
@@ -161,6 +168,11 @@ def headline() -> dict:
         return {"tone": "good", "n": len(b["replied"]),
                 "text": f"{len(b['replied'])} {'company has' if len(b['replied']) == 1 else 'companies have'} replied",
                 "where": "replied"}
+    ready = [r for r in b["shortlisted"] if r["action"]["kind"] == "review"]
+    if ready:
+        return {"tone": "act", "n": len(ready),
+                "text": f"{len(ready)} draft{'s' if len(ready) != 1 else ''} to read",
+                "where": "shortlisted"}
     if b["found"]:
         return {"tone": "act", "n": len(b["found"]),
                 "text": f"{len(b['found'])} new opening{'s' if len(b['found']) != 1 else ''} to look at",

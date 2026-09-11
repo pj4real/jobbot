@@ -149,6 +149,9 @@ CREATE TABLE IF NOT EXISTS send_log (
 CREATE INDEX IF NOT EXISTS ix_send_day ON send_log(day);
 
 -- ---------------------------------------------------------------- v2 --------
+-- Column additions live in core/db.py COLUMNS, not here: ALTER TABLE ADD
+-- COLUMN is not idempotent, and parsing SQL to work around that kept
+-- breaking on comments.
 
 -- Sender memory. Scanning a whole inbox only stays cheap because a sender you
 -- have already judged never costs anything again. One "not a job" on a
@@ -179,7 +182,3 @@ CREATE TABLE IF NOT EXISTS timeline (
 CREATE INDEX IF NOT EXISTS ix_timeline_job ON timeline(job_id, at);
 
 -- Your own triage on a found job, before any application exists.
-ALTER TABLE jobs ADD COLUMN triage TEXT;          -- NULL | shortlisted | skipped
-ALTER TABLE jobs ADD COLUMN triage_at TEXT;
-ALTER TABLE jobs ADD COLUMN sender_id INTEGER REFERENCES senders(id);
-ALTER TABLE senders ADD COLUMN decided_by TEXT NOT NULL DEFAULT 'system';

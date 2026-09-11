@@ -11,6 +11,7 @@ DB_PATH = path("data", "jobs.db")
 
 _schema_checked = False
 schema_created = False   # True if this process had to build the schema itself
+schema_migrated = False  # True if it had to add columns a newer version wants
 
 
 def connect() -> sqlite3.Connection:
@@ -23,22 +24,55 @@ def connect() -> sqlite3.Connection:
     except sqlite3.OperationalError:
         pass  # WAL is unsupported on some mounted filesystems; rollback journal is fine
 
-    # An interrupted first init leaves the file present but empty, and every
-    # caller then dies on "no such table". The file existing is not the same
-    # as the schema existing, so check the thing that actually matters.
+    # Two ways a database can be behind, and both used to surface as a crash
+    # in whatever command you happened to run:
+    #   the file exists but has no tables, from an interrupted first init
+    #   the tables exist but are missing columns a newer version added
+    # Neither is worth making you diagnose, so both are repaired on the first
+    # connection of the process.
     global _schema_checked
     if not _schema_checked:
         _schema_checked = True
-        have = conn.execute(
-            "SELECT COUNT(*) n FROM sqlite_master WHERE type='table' AND name='jobs'"
-        ).fetchone()["n"]
-        if not have:
-            global schema_created
-            schema_created = True
-            sql = (Path(__file__).parent / "schema.sql").read_text()
-            conn.executescript(sql)
-            conn.commit()
+        _ensure_schema(conn)
     return conn
+
+
+# Columns added after the first release. Expressed here rather than as ALTER
+# statements in schema.sql because ALTER TABLE ADD COLUMN is not idempotent,
+# and every attempt to work around that by splitting the .sql file on
+# semicolons broke on a comment sooner or later.
+COLUMNS = [
+    ("jobs", "triage", "TEXT"),
+    ("jobs", "triage_at", "TEXT"),
+    ("jobs", "sender_id", "INTEGER"),
+    ("jobs", "resolved_at", "TEXT"),
+    ("senders", "decided_by", "TEXT NOT NULL DEFAULT 'system'"),
+]
+
+
+def _ensure_schema(conn) -> None:
+    global schema_created, schema_migrated
+
+    had_jobs = conn.execute(
+        "SELECT COUNT(*) n FROM sqlite_master WHERE type='table' AND name='jobs'"
+    ).fetchone()["n"]
+
+    # every CREATE in the file is IF NOT EXISTS, so this is safe to rerun and
+    # sqlite parses its own comments correctly, which is the whole point
+    conn.executescript((Path(__file__).parent / "schema.sql").read_text())
+    if not had_jobs:
+        schema_created = True
+
+    for table, column, decl in COLUMNS:
+        try:
+            cols = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+        except sqlite3.OperationalError:
+            continue                      # table not there yet, nothing to add
+        if not cols or column in cols:
+            continue
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+        schema_migrated = True
+    conn.commit()
 
 
 @contextmanager
@@ -55,21 +89,13 @@ def tx():
 
 
 def init() -> None:
-    """Idempotent. CREATE TABLE IF NOT EXISTS handles itself, but ALTER TABLE
-    ADD COLUMN does not, so those run one at a time and a duplicate is fine."""
-    sql = (Path(__file__).parent / "schema.sql").read_text()
-    head, _, alters = sql.partition("-- v2 --")
-    with tx() as c:
-        c.executescript(head)
-    for stmt in [s.strip() for s in alters.split(";") if s.strip()]:
-        if not stmt.upper().startswith(("ALTER", "CREATE")):
-            continue
-        try:
-            with tx() as c:
-                c.execute(stmt)
-        except sqlite3.OperationalError as e:
-            if "duplicate column" not in str(e).lower():
-                raise
+    """Idempotent. Connecting already repairs the schema, so this exists to be
+    an explicit, obvious thing you can run."""
+    conn = connect()
+    try:
+        _ensure_schema(conn)
+    finally:
+        conn.close()
 
 
 def log(entity: str, entity_id, kind: str, **payload) -> None:

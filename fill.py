@@ -49,6 +49,8 @@ def main():
     ap.add_argument("url")
     ap.add_argument("--resume", help="pdf to upload, defaults to assets/resume_default.pdf")
     ap.add_argument("--dump", action="store_true", help="list detected fields, fill nothing")
+    ap.add_argument("--force", action="store_true",
+                    help="fill even a link that does not look like a form")
     ap.add_argument("--headless", action="store_true",
                     help="no window. fine for --dump; you cannot review a form you cannot see")
     ap.add_argument("--wait", type=int, default=4000, help="ms to settle after load")
@@ -56,6 +58,16 @@ def main():
                     help="stay open until this file appears. The dashboard uses "
                          "this so the browser waits for you rather than for a tty")
     args = ap.parse_args()
+
+    from core.urls import fillable, canonical
+    ok, why = fillable(args.url)
+    if not ok and not args.force:
+        clean = canonical(args.url)[0]
+        print(f"\n  Not filling this one.\n\n  {why}\n")
+        if clean:
+            print(f"  Open it instead:\n    {clean}\n")
+        print("  If you are sure, rerun with --force.\n")
+        return
 
     try:
         from playwright.sync_api import sync_playwright
@@ -66,6 +78,22 @@ def main():
     flat = flat_profile()
     bank = profile().get("answer_bank", {}) or {}
     PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+
+    try:
+        _pw = sync_playwright().start()
+    except Exception as e:                          # noqa: BLE001
+        sys.exit(f"could not start playwright: {e}")
+    try:
+        _probe = _pw.chromium.executable_path
+        if _probe and not Path(_probe).exists():
+            raise FileNotFoundError(_probe)
+    except Exception:
+        _pw.stop()
+        sys.exit("\n  Chromium is not installed yet. One command:\n\n"
+                 "      playwright install chromium\n\n"
+                 "  Playwright ships the library separately from the browser it\n"
+                 "  drives, so a fresh venv has the first and not the second.\n")
+    _pw.stop()
 
     with sync_playwright() as pw:
         ctx = pw.chromium.launch_persistent_context(

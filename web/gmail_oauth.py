@@ -94,7 +94,13 @@ def start(which: str, redirect_uri: str) -> str:
         include_granted_scopes="false",  # keep the two connections separate
         prompt="consent",               # force a refresh token even on reconnect
         state=state)
-    _pending[state] = {"which": which, "redirect_uri": redirect_uri}
+
+    # PKCE: authorization_url() just generated a code_verifier and hashed it
+    # into the URL. The callback arrives as a separate request and builds a
+    # fresh Flow, which would have no idea what that verifier was, and Google
+    # answers "invalid_grant: Missing code verifier". So carry it across.
+    _pending[state] = {"which": which, "redirect_uri": redirect_uri,
+                       "code_verifier": getattr(flow, "code_verifier", None)}
     return url
 
 
@@ -104,10 +110,17 @@ def finish(state: str, full_url: str) -> str:
         raise OAuthError("That consent link has expired or was already used. "
                          "Start the connection again.")
     flow = _flow(p["which"], p["redirect_uri"])
+    if p.get("code_verifier"):
+        flow.code_verifier = p["code_verifier"]
     try:
         flow.fetch_token(authorization_response=full_url)
     except Exception as e:                       # noqa: BLE001
-        raise OAuthError(f"Google refused the exchange: {e}") from e
+        msg = str(e)
+        if "code verifier" in msg.lower():
+            msg += ("  This means the consent link was made by a different run "
+                    "of the dashboard. Restarting it clears the pending links, "
+                    "so start the connection again from this page.")
+        raise OAuthError(f"Google refused the exchange: {msg}") from e
 
     cfg = CONNECTIONS[p["which"]]
 

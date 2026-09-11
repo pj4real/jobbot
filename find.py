@@ -4,6 +4,7 @@
     python find.py run                 collect + extract + score, the daily command
     python find.py collect             pull new items only
     python find.py extract             parse pending items only
+    python find.py resolve             open linkedin postings, find the real form
     python find.py list                show the queue
     python find.py list --all          include low scoring and already applied
     python find.py show <id>           one job in full
@@ -140,6 +141,33 @@ def cmd_open(a):
     return 0
 
 
+def cmd_resolve(a):
+    """Open the LinkedIn postings you were sent and find the real apply route."""
+    from collectors import linkedin
+    todo = linkedin.pending(999)
+    if not todo:
+        print("  nothing to resolve. Every LinkedIn posting already has a real")
+        print("  description and an apply route worked out.")
+        return 0
+    cap = a.limit if a.limit != 40 else None
+    print(f"  {len(todo)} LinkedIn postings unresolved, opening up to "
+          f"{cap or config().get('sources', {}).get('linkedin', {}).get('resolve_cap', 15)}")
+    print("  a browser window will open. Leave it alone while it works.\n")
+    s = linkedin.resolve(limit=cap, headless=a.headless)
+    if s.get("signed_out"):
+        print("\n  Stopped at the sign-in wall. Sign in, then run this again.")
+        return 1
+    print(f"\n  looked at {s['looked_at']}")
+    print(f"  {s['external']} now point at a real form and can be filled")
+    print(f"  {s['easy_apply']} are Easy Apply, yours to click through")
+    print(f"  {s['unknown']} could not be worked out, {s['failed']} failed to load")
+    if s["described"]:
+        print(f"  {s['described']} got their full description, and were rescored")
+    if s["external"]:
+        print("\n  the fillable ones are on the board now")
+    return 0
+
+
 def cmd_rescore(a):
     from core.score import rescore_all
     print(f"  rescored {rescore_all()} jobs")
@@ -161,8 +189,8 @@ def cmd_unparsed(a):
 
 
 COMMANDS = {"run": cmd_run, "collect": cmd_collect, "extract": cmd_extract,
-            "list": cmd_list, "show": cmd_show, "open": cmd_open,
-            "rescore": cmd_rescore, "unparsed": cmd_unparsed}
+            "resolve": cmd_resolve, "list": cmd_list, "show": cmd_show,
+            "open": cmd_open, "rescore": cmd_rescore, "unparsed": cmd_unparsed}
 
 
 def main():
@@ -173,6 +201,8 @@ def main():
     p.add_argument("--all", action="store_true", help="include low scoring jobs")
     p.add_argument("--limit", type=int, default=40)
     p.add_argument("--no-llm", action="store_true", help="regex only, no model calls")
+    p.add_argument("--headless", action="store_true",
+                   help="resolve: no visible window")
     a = p.parse_args()
     if a.command in ("show", "open") and a.id is None:
         p.error(f"{a.command} needs a job id")

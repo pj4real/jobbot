@@ -34,6 +34,15 @@ sources:
     label: job-alerts         # used only when scan_all is false
     lookback_days: 30
     max_messages: 800         # ceiling per run, so a first scan cannot run away
+  linkedin:
+    # Resolving only ever opens job links you were already emailed, in the
+    # browser profile you are signed into, and never clicks Apply or submits.
+    # It is still automated access, which LinkedIn's terms do not allow, and
+    # the penalty lands on the account recruiters use to find you. These two
+    # numbers are the dial.
+    resolve_cap: 15           # postings per run
+    gap_seconds: 6            # randomised to between this and 2.2x this
+
   whatsapp:
     enabled: false            # turn on at step 06
     waha_url: http://localhost:3000

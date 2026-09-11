@@ -96,28 +96,35 @@ def dedupe_hash(company: str, title: str, location: str) -> str:
 
 
 def classify_url(url: str) -> str:
-    host = (urlparse(url).hostname or "").lower()
-    for pat, kind in ATS_HOSTS.items():
-        if host.endswith(pat) or pat in host:
-            return kind
-    return "unknown"
+    from .urls import canonical
+    return canonical(url)[2] or "unknown"
 
 
 def pick_apply_url(text: str) -> tuple[str, str]:
-    """Prefer a URL on a known ATS host over a tracking or unsubscribe link."""
-    urls = URL_RE.findall(text)
+    """Best link in the mail, cleaned of tracking.
+
+    Ranked by what you can actually do with it: a real form beats a posting
+    page beats nothing. Alert digests and search pages are discarded, because
+    a first real scan showed most LinkedIn links in an alert mail are exactly
+    that and the filler was being launched at them.
+    """
+    from .urls import canonical
+
     best, best_kind, best_rank = "", "unknown", -1
-    for u in urls:
-        u = u.rstrip(".,);]")
-        low = u.lower()
-        if any(x in low for x in ("unsubscribe", "/tracking", "utm_", "mailto:",
-                                  "privacy", "notification-settings", "twitter.com",
+    for raw in URL_RE.findall(text):
+        low = raw.lower()
+        if any(x in low for x in ("unsubscribe", "mailto:", "privacy",
+                                  "notification-settings", "twitter.com",
                                   "facebook.com", "instagram.com")):
             continue
-        kind = classify_url(u)
-        rank = 2 if kind not in ("unknown", "linkedin", "naukri") else (1 if kind != "unknown" else 0)
+        clean, kind, platform = canonical(raw)
+        if kind == "noise":
+            continue
+        rank = {"form": 2, "posting": 1}.get(kind, 0)
+        if platform == "unknown" and kind == "form":
+            rank = 2                      # a company careers page is worth most
         if rank > best_rank:
-            best, best_kind, best_rank = u, kind, rank
+            best, best_kind, best_rank = clean, platform, rank
     return best, best_kind
 
 

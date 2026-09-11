@@ -110,6 +110,9 @@ def job_row(r: dict) -> str:
         buttons.append(f'<button class="btn-warn sm" data-job="followup">Follow up</button>')
     elif a["kind"] == "reply":
         buttons.append(f'<a class="btn sm" href="/job/{jid}">Open</a>')
+    elif a["kind"] == "open" and r.get("apply_url"):
+        buttons.append(f'<a class="btn btn-go sm" href="{E(r["apply_url"])}" '
+                       f'target="_blank" rel="noopener">Open posting</a>')
     if r.get("apply_url") and a["kind"] not in ("triage",):
         buttons.append(f'<a class="btn sm" href="{E(r["apply_url"])}" target="_blank" '
                        f'rel="noopener">Site</a>')
@@ -271,9 +274,15 @@ def job_page(job_id: int):
 
     acts = []
     if j.get("apply_url"):
-        acts.append(f'<button class="go" data-fill="{job_id}">Fill the form</button>')
-        acts.append(f'<a class="btn" href="{E(j["apply_url"])}" target="_blank" '
-                    f'rel="noopener">Open the posting</a>')
+        from core.urls import fillable
+        can_fill, why = fillable(j["apply_url"])
+        if can_fill:
+            acts.append(f'<button class="go" data-fill="{job_id}">Fill the form</button>')
+        acts.append(f'<a class="btn{"" if can_fill else " btn-go"}" '
+                    f'href="{E(j["apply_url"])}" target="_blank" rel="noopener">'
+                    f'Open the posting</a>')
+        if not can_fill:
+            src += ui.note(E(why), "act")
     if j.get("app_id"):
         acts.append(f'<a class="btn" href="/draft/{j["app_id"]}">Open the draft</a>')
     if j["stage"] == "found":
@@ -583,8 +592,10 @@ def setup(saved: str = "", error: str = "", run: str = "", start: str = ""):
   <button class="btn-quiet sm" onclick="stopRun()">Stop</button>
 </div>
 <div id="log" class="dim">Output appears here.</div>
+<div id="result"></div>
 <div class="cards">
   {rc("find", "Scan my mail", "Search your whole mailbox for openings, score them, add them to the board.", "go")}
+  {rc("resolve", "Resolve LinkedIn postings", "Opens the LinkedIn jobs you were emailed and follows Apply to the company's own form. Those become fillable.", "go")}
   {rc("draft", "Write outreach", "Draft a mail for every kept job that has a verified address.")}
   {rc("followup", "Queue follow ups", "One per application, a week after sending, only if nobody replied.")}
   {rc("send_dry", "Preview sending", "Shows exactly what would go out. Sends nothing.")}
@@ -676,14 +687,34 @@ async function tick(){
   else if(d.done){ clearInterval(poll); poll=null;
     status(d.label+(d.code?' — failed (exit '+d.code+')':' — done'), d.code?'err':'ok');
     document.querySelectorAll('button[data-job]').forEach(b=>b.disabled=false);
-    el('doneBtn')?.remove(); }
+    el('doneBtn')?.remove();
+    showResult(d); }
   else status(d.label+' — running','run');
+}
+function showResult(d){
+  const box = el('result'); if(!box) return;
+  if (d.code) {
+    box.className = 'note bad';
+    box.innerHTML = '<b>That did not finish.</b> The last lines above say why.';
+    return;
+  }
+  const nothing = /^nothing\b/i.test(d.summary || '');
+  box.className = 'note ' + (nothing ? '' : 'good');
+  box.innerHTML = '<b>' + (d.summary || 'Finished.') + '</b>'
+    + (d.landing && !nothing
+       ? ' <a class="btn btn-go sm" style="margin-left:10px" href="' + d.landing
+         + '">' + d.landing_label + '</a>'
+       : '');
 }
 function watch(id){ curRun=id; if(poll) clearInterval(poll);
   poll=setInterval(tick,700); tick(); }
 async function run(job){
   document.querySelectorAll('button[data-job]').forEach(b=>b.disabled=true);
+  el('result')?.replaceChildren();
   paint(['starting '+job+' ...']);
+  // bring the output to the eye. The cards are below the log, so without this
+  // the whole run happens off screen.
+  document.getElementById('run')?.scrollIntoView({behavior:'smooth',block:'start'});
   const r=await fetch('/api/run/'+job,{method:'POST'});
   if(!r.ok){ paint(['could not start: '+await r.text()]);
     document.querySelectorAll('button[data-job]').forEach(b=>b.disabled=false); return; }

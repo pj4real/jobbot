@@ -104,6 +104,111 @@ check("ashby beats linkedin as the apply link",
       p3 and "ashbyhq" in p3["apply_url"], p3 and p3["apply_url"])
 
 
+# ------------------------------------------------------------------ links
+section("apply links")
+
+from core.urls import canonical, fillable                       # noqa: E402
+
+# every one of these came out of a real scan of a real inbox
+LINKS = [
+    ("https://www.linkedin.com/comm/jobs/alerts?lipi=urn%3Ali%3Apage%3Aemail",
+     "noise", "linkedin", False),
+    ("https://www.linkedin.com/comm/jobs/view/4456198009/?trackingId=abc%3D%3D&refId=x",
+     "posting", "linkedin", False),
+    ("https://in.indeed.com/rc/clk/dl?jk=24c49281ac62ecfa&from=ja&qd=RnZh",
+     "posting", "indeed", False),
+    ("https://boards.greenhouse.io/postman/jobs/7788990?utm_source=alert",
+     "form", "greenhouse", True),
+    ("https://jobs.lever.co/zeta/abc-123", "form", "lever", True),
+    ("https://docs.google.com/forms/d/e/1FAIpQL-x/viewform", "form", "gform", True),
+    ("https://careers.acme.com/jobs/apply/9981", "form", "unknown", True),
+]
+bad = []
+for url, want_kind, want_plat, want_fill in LINKS:
+    _, kind, plat = canonical(url)
+    ok, _ = fillable(url)
+    if (kind, plat, ok) != (want_kind, want_plat, want_fill):
+        bad.append(f"{url[:36]} -> {kind}/{plat}/{ok}")
+check(f"all {len(LINKS)} real link shapes sorted correctly", not bad, str(bad[:2]))
+
+check("a linkedin job link loses its tracking",
+      canonical("https://www.linkedin.com/comm/jobs/view/442/?trackingId=zz&refId=q")[0]
+      == "https://www.linkedin.com/jobs/view/442/")
+check("an indeed redirect becomes a readable viewjob link",
+      canonical("https://in.indeed.com/rc/clk/dl?jk=deadbeef01&from=ja")[0]
+      == "https://in.indeed.com/viewjob?jk=deadbeef01")
+check("utm noise is stripped from a real form",
+      "utm_source" not in canonical(
+          "https://jobs.lever.co/x/1?utm_source=alert&utm_campaign=q")[0])
+check("the same job through two trackers canonicalises the same",
+      canonical("https://www.linkedin.com/comm/jobs/view/9/?trackingId=a")[0]
+      == canonical("https://www.linkedin.com/jobs/view/9/?trk=b")[0])
+
+_ok, _why = fillable("https://www.linkedin.com/jobs/view/442/")
+check("refusing linkedin explains why rather than just failing",
+      not _ok and "terms" in _why.lower(), _why[:60])
+check("a digest link is refused as having nothing to fill",
+      not fillable("https://www.linkedin.com/comm/jobs/alerts?lipi=x")[0])
+
+
+# ------------------------------------------------------------------ linkedin
+section("linkedin resolver")
+
+FIX = ROOT / "tests" / "fixtures"
+try:
+    from playwright.sync_api import sync_playwright as _spw
+    _HAVE_PW = True
+except ImportError:
+    _HAVE_PW = False
+
+if _HAVE_PW and (FIX / "linkedin_external.html").exists():
+    from collectors import linkedin as li                       # noqa: E402
+    with _spw() as _pw:
+        _b = _pw.chromium.launch()
+        _p = _b.new_page()
+
+        _p.goto((FIX / "linkedin_external.html").as_uri())
+        kind, target = li._apply_target(_p)
+        check("an external posting resolves to the company form",
+              kind == "external" and "greenhouse.io" in target, f"{kind} {target[:40]}")
+        from core.urls import canonical
+        check("and that form canonicalises to something fillable",
+              canonical(target)[1] == "form", canonical(target)[1])
+        desc = li._first_text(_p, li.DESC_SELECTORS)
+        check("the real description is far longer than an alert summary",
+              len(desc) > 250, f"{len(desc)} chars")
+        check("the title is read off the page",
+              "Software Engineer Intern" in li._first_text(_p, li.META_SELECTORS["title"], 160))
+        check("signed in is detected", li._signed_in(_p))
+
+        _p.goto((FIX / "linkedin_easy.html").as_uri())
+        kind, target = li._apply_target(_p)
+        check("an easy apply posting is recognised as such",
+              kind == "easy_apply", kind)
+        check("and offers no external url to chase", not target)
+
+        _p.goto((FIX / "linkedin_authwall.html").as_uri())
+        check("a sign-in wall is detected rather than parsed as a job",
+              not li._signed_in(_p))
+        _b.close()
+else:
+    check("linkedin fixtures present", (FIX / "linkedin_external.html").exists())
+
+_li_src = (ROOT / "collectors" / "linkedin.py").read_text()
+check("the resolver never clicks apply",
+      ".click(" not in _li_src, "found a click call")
+check("it never submits anything",
+      "submit" not in _li_src.lower().replace("never submits", ""))
+check("it only opens links already in the database",
+      "/jobs/view/" in _li_src and "linkedin.com/jobs/search" not in _li_src)
+check("pacing is randomised, not a fixed interval",
+      "random.uniform" in _li_src)
+_cfg_li = __import__("core.config", fromlist=["config"]).config()["sources"].get("linkedin", {})
+check("there is a per run cap", int(_cfg_li.get("resolve_cap", 0)) > 0)
+check("and the cap is modest", int(_cfg_li.get("resolve_cap", 99)) <= 40,
+      str(_cfg_li.get("resolve_cap")))
+
+
 # ------------------------------------------------------------------ scoring
 section("scoring")
 
@@ -398,6 +503,19 @@ check("loopback http is allowed",
       _os.environ.get("OAUTHLIB_INSECURE_TRANSPORT") == "1")
 check("and the scope check is relaxed so google adding openid is not fatal",
       _os.environ.get("OAUTHLIB_RELAX_TOKEN_SCOPE") == "1")
+# PKCE: the consent URL carries a hash of a verifier the callback must send
+# back. The callback is a separate request that builds a fresh Flow, so the
+# verifier has to be carried across or Google says "Missing code verifier".
+import inspect                                                  # noqa: E402
+_start_src = inspect.getsource(go.start)
+_finish_src = inspect.getsource(go.finish)
+check("the consent step keeps the pkce verifier",
+      "code_verifier" in _start_src)
+check("and the callback puts it back on the new flow",
+      "flow.code_verifier" in _finish_src)
+check("a pending link carries which, redirect and verifier",
+      all(k in _start_src for k in ("which", "redirect_uri", "code_verifier")))
+
 check("a remote host is still refused",
       _refuse(lambda: go._allow_loopback_http("http://example.com/cb")))
 check("https elsewhere is refused too, this is loopback only",

@@ -11,6 +11,7 @@ import os
 import sys
 import time
 import uuid
+import re
 import shlex
 import threading
 import subprocess
@@ -21,11 +22,29 @@ ROOT = Path(__file__).resolve().parent.parent
 PY = sys.executable
 
 # name -> (argv, human label, whether it can change the outside world)
+# where to send you once a job finishes, and what to call the link. A run that
+# changes something you cannot see is the same as a run that did nothing.
+LANDING = {
+    "find":      ("/?stage=found", "See what it found"),
+    "collect":   ("/?stage=found", "See the board"),
+    "extract":   ("/?stage=found", "See what it found"),
+    "extract_norm": ("/?stage=found", "See what it found"),
+    "resolve":   ("/?stage=found", "See the board"),
+    "rescore":   ("/?stage=found", "See the board"),
+    "draft":     ("/?stage=shortlisted", "Read the drafts"),
+    "draft_tpl": ("/?stage=shortlisted", "Read the drafts"),
+    "followup":  ("/?stage=waiting", "Read the follow ups"),
+    "send_dry":  ("/?stage=shortlisted", "Back to the board"),
+    "send_live": ("/?stage=applied", "See what went out"),
+    "track":     ("/?stage=replied", "See the replies"),
+}
+
 JOBS: dict[str, tuple[list[str], str, bool]] = {
     "find":      (["find.py", "run"],              "Collect and parse new openings", False),
     "collect":   (["find.py", "collect"],          "Pull new mail only", False),
     "extract":   (["find.py", "extract"],          "Parse pending items", False),
     "extract_norm": (["find.py", "extract", "--no-llm"], "Parse, regex only", False),
+    "resolve":   (["find.py", "resolve"],          "Open LinkedIn postings, find the real form", False),
     "rescore":   (["find.py", "rescore"],          "Rescore everything", False),
     "draft":     (["mail.py", "draft"],            "Write outreach drafts", False),
     "draft_tpl": (["mail.py", "draft", "--no-llm"], "Draft from template only", False),
@@ -130,10 +149,28 @@ def get(run_id: str) -> dict | None:
     if not r:
         return None
     with _lock:
+        href, label = LANDING.get(r["job"], ("", ""))
         return {"id": r["id"], "job": r["job"], "label": r["label"], "cmd": r["cmd"],
                 "done": r["done"], "code": r["code"], "lines": list(r["lines"]),
                 "started": r["started"], "ended": r["ended"],
-                "awaiting_release": bool(r.get("release")) and not r["done"]}
+                "awaiting_release": bool(r.get("release")) and not r["done"],
+                "landing": href, "landing_label": label,
+                "summary": _summarise(r) if r["done"] else ""}
+
+
+SUMMARY_LINES = re.compile(
+    r"^\s*(\d+\s+drafts? waiting|\d+ would go out|\d+ sent|"
+    r"\d+ queued|matched \d+|kept \d+|\d+ passed|pending \d+|"
+    r"\d+ now point at|looked at \d+|nothing .*)", re.I)
+
+
+def _summarise(r: dict) -> str:
+    """The one line worth reading out of a run's output."""
+    lines = [l.strip() for l in r["lines"] if l.strip()]
+    for line in reversed(lines):
+        if SUMMARY_LINES.match(line):
+            return line
+    return lines[-1][:160] if lines else ""
 
 
 def recent(n: int = 12) -> list[dict]:

@@ -255,6 +255,7 @@ def shell(body: str, tab: str = "", scripts: str = "") -> str:
   <a class="mark" href="/">job<i>bot</i></a>
   <nav class="tabs">{tabs}</nav>
   <div class="grow"></div>
+  <a class="btn sm" href="/setup?start=find#run">Scan</a>
   <a class="btn sm" href="/setup#run">Run</a>
 </div>
 {body}
